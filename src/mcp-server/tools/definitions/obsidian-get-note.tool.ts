@@ -9,7 +9,7 @@ import { JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/err
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
 import { computeFenceMask, extractSection } from '@/services/obsidian/section-extractor.js';
 import type { NoteJson, SectionTarget } from '@/services/obsidian/types.js';
-import { SectionSchema, TargetSchema } from './_shared/schemas.js';
+import { SectionSchema, SectionShape, TargetSchema } from './_shared/schemas.js';
 import { withCaseFallback } from './_shared/suggest-paths.js';
 
 const StatSchema = z.object({
@@ -93,7 +93,7 @@ export const obsidianGetNote = tool('obsidian_get_note', {
           .object({
             format: z.literal('section').describe('Echoed format discriminator.'),
             path: z.string().describe('Resolved vault-relative path of the note.'),
-            section: SectionSchema.describe('Echoed section locator.'),
+            section: SectionShape.describe('Echoed section locator.'),
             valueText: z
               .string()
               .optional()

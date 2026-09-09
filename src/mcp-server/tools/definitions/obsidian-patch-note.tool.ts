@@ -12,6 +12,7 @@ import {
   ContentTypeSchema,
   PatchOptionsSchema,
   SectionSchema,
+  SectionShape,
   TargetSchema,
 } from './_shared/schemas.js';
 
@@ -37,7 +38,7 @@ export const obsidianPatchNote = tool('obsidian_patch_note', {
   }),
   output: z.object({
     path: z.string().describe('Resolved vault-relative path of the note.'),
-    section: SectionSchema.describe(
+    section: SectionShape.describe(
       'Section locator the patch was applied to. For headings this is the resolved locator — a bare leaf name is reported back as its full `Parent::Child` path.',
     ),
     operation: z

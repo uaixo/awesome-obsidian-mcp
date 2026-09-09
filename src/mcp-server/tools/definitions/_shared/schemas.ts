@@ -8,7 +8,7 @@
 import { z } from '@cyanheads/mcp-ts-core';
 
 /** Where a note lives — vault path, the active file, or a periodic note. */
-export const TargetSchema = z.discriminatedUnion('type', [
+const TargetVariants = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('path').describe('Address by vault-relative path.'),
@@ -38,8 +38,35 @@ export const TargetSchema = z.discriminatedUnion('type', [
     .describe('Address a periodic note (current or dated).'),
 ]);
 
-/** Sub-document target inside a note. */
-export const SectionSchema = z.object({
+/**
+ * Accept an object argument that arrived as a JSON string.
+ *
+ * Some tool-calling models — notably local/open-weight ones served over
+ * OpenAI-compatible endpoints — serialize nested object parameters as a JSON
+ * string instead of a real object, which made every `target` call fail with
+ * "expected object, received string". Parsing that form here keeps the union
+ * below as the single source of truth for what a valid target actually is:
+ * anything that is not a JSON object literal is passed through untouched so
+ * the union still produces the normal validation error.
+ */
+const jsonObjectArg = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((value) => {
+    if (typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    if (!trimmed.startsWith('{')) return value;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      return typeof parsed === 'object' && parsed !== null ? parsed : value;
+    } catch {
+      return value;
+    }
+  }, schema);
+
+/** Where a note lives — vault path, the active file, or a periodic note. */
+export const TargetSchema = jsonObjectArg(TargetVariants);
+
+/** Sub-document target inside a note (raw shape — use for echoing in tool OUTPUT). */
+export const SectionShape = z.object({
   type: z
     .enum(['heading', 'block', 'frontmatter'])
     .describe('Heading by name, block by reference, or frontmatter field by key.'),
@@ -51,7 +78,10 @@ export const SectionSchema = z.object({
     ),
 });
 
-export const PatchOptionsSchema = z
+/** Input-facing section: tolerates a JSON-string-encoded object. */
+export const SectionSchema = jsonObjectArg(SectionShape);
+
+const PatchOptionsShape = z
   .object({
     createTargetIfMissing: z
       .boolean()
@@ -67,8 +97,10 @@ export const PatchOptionsSchema = z
       .boolean()
       .default(false)
       .describe('Trim whitespace from the target section before applying the operation.'),
-  })
-  .optional();
+  });
+
+/** Input-facing patch options: tolerates a JSON-string-encoded object. */
+export const PatchOptionsSchema = jsonObjectArg(PatchOptionsShape).optional();
 
 export const ContentTypeSchema = z
   .enum(['markdown', 'json'])
@@ -77,5 +109,5 @@ export const ContentTypeSchema = z
     'Content body format. Use "json" for typed frontmatter values or block-targeted table rows. JSON values must be valid JSON literals — strings need quoting (`"\\"draft\\""`, not `"draft"`), and numbers/booleans/arrays/objects pass through as-is.',
   );
 
-export type ToolTarget = z.infer<typeof TargetSchema>;
-export type ToolSection = z.infer<typeof SectionSchema>;
+export type ToolTarget = z.infer<typeof TargetVariants>;
+export type ToolSection = z.infer<typeof SectionShape>;
