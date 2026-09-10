@@ -81,23 +81,22 @@ export const SectionShape = z.object({
 /** Input-facing section: tolerates a JSON-string-encoded object. */
 export const SectionSchema = jsonObjectArg(SectionShape);
 
-const PatchOptionsShape = z
-  .object({
-    createTargetIfMissing: z
-      .boolean()
-      .default(false)
-      .describe('Create the target heading/block/frontmatter field if it does not exist.'),
-    applyIfContentPreexists: z
-      .boolean()
-      .default(false)
-      .describe(
-        'When false (default), the patch is rejected if the supplied content already appears in the target — idempotent against retries. Set to true to force-apply even when it would duplicate. Replace operations are never rejected.',
-      ),
-    trimTargetWhitespace: z
-      .boolean()
-      .default(false)
-      .describe('Trim whitespace from the target section before applying the operation.'),
-  });
+const PatchOptionsShape = z.object({
+  createTargetIfMissing: z
+    .boolean()
+    .default(false)
+    .describe('Create the target heading/block/frontmatter field if it does not exist.'),
+  applyIfContentPreexists: z
+    .boolean()
+    .default(false)
+    .describe(
+      'When false (default), the patch is rejected if the supplied content already appears in the target — idempotent against retries. Set to true to force-apply even when it would duplicate. Replace operations are never rejected.',
+    ),
+  trimTargetWhitespace: z
+    .boolean()
+    .default(false)
+    .describe('Trim whitespace from the target section before applying the operation.'),
+});
 
 /** Input-facing patch options: tolerates a JSON-string-encoded object. */
 export const PatchOptionsSchema = jsonObjectArg(PatchOptionsShape).optional();
