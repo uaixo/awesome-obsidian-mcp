@@ -7,7 +7,7 @@
 
 <div align="center">
 
-[![Version](https://img.shields.io/badge/Version-3.5.2-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/obsidian-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/obsidian-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/obsidian-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.3.0-blueviolet.svg?style=flat-square)](https://bun.sh/)
+[![Version](https://img.shields.io/badge/Version-3.5.4-blue.svg?style=flat-square)](./CHANGELOG.md) [![License](https://img.shields.io/badge/License-Apache%202.0-orange.svg?style=flat-square)](./LICENSE) [![Docker](https://img.shields.io/badge/Docker-ghcr.io-2496ED?style=flat-square&logo=docker&logoColor=white)](https://github.com/users/cyanheads/packages/container/package/obsidian-mcp-server) [![MCP SDK](https://img.shields.io/badge/MCP%20SDK-^2.0.0-green.svg?style=flat-square)](https://modelcontextprotocol.io/) [![npm](https://img.shields.io/npm/v/obsidian-mcp-server?style=flat-square&logo=npm&logoColor=white)](https://www.npmjs.com/package/obsidian-mcp-server) [![TypeScript](https://img.shields.io/badge/TypeScript-^7.0.2-3178C6.svg?style=flat-square)](https://www.typescriptlang.org/) [![Bun](https://img.shields.io/badge/Bun-v1.4.0%2B-blueviolet.svg?style=flat-square)](https://bun.sh/)
 
 </div>
 
@@ -21,12 +21,14 @@
 
 ---
 
-## Tools
+## Overview
 
-Fourteen tools grouped by shape — readers fetch notes and metadata, writers create or surgically edit content, managers reconcile tags and frontmatter, and a guarded escape hatch dispatches Obsidian command-palette commands.
+Read, write, search, and surgically edit Obsidian vault notes — sections, frontmatter, tags — over the Local REST API plugin, with folder-scoped read/write permissions built in. Runs as a stdio process or a local Streamable HTTP server.
 
-| Tool Name | Description |
-|:----------|:------------|
+### Tools
+
+| Tool | Description |
+|:---|:---|
 | `obsidian_get_note` | Read a note as raw content, full structured form (content + frontmatter + tags + stat, with optional outgoing links), structural document map, or a single section. |
 | `obsidian_list_notes` | List notes and subdirectories under a vault path. Recursive walk (default depth 2, max depth 20; 1000-entry cap) with optional `extension` and `nameRegex` filters. |
 | `obsidian_list_tags` | List vault tags with usage counts, including hierarchical parents. Ordered by count descending and capped at `limit` (default 200, max 10000), with the withheld remainder disclosed. Optional `nameRegex` and `minCount` narrow the set first. |
@@ -42,123 +44,159 @@ Fourteen tools grouped by shape — readers fetch notes and metadata, writers cr
 | `obsidian_open_in_ui` | Open a file in the Obsidian app UI, with `failIfMissing` and `newLeaf` toggles. |
 | `obsidian_execute_command` | Execute an Obsidian command-palette command by ID. **Opt-in via `OBSIDIAN_ENABLE_COMMANDS=true`.** |
 
-### `obsidian_get_note`
+### Resources
 
-Read a note in one of four projections, addressed by vault path, the active file, or a periodic note (`daily`, `weekly`, `monthly`, `quarterly`, `yearly`).
+| Resource | Description |
+|:---|:---|
+| `obsidian://vault/{+path}` | A note in the vault — content, frontmatter, tags, and file metadata. |
+| `obsidian://tags` | All tags found across the vault, with usage counts (full snapshot). |
+| `obsidian://status` | Server reachability, auth status, plugin/Obsidian version info, and registered API extensions. |
 
-- `format: "content"` — raw markdown body
-- `format: "full"` — content, frontmatter, tags, and file metadata; pass `includeLinks: true` to also parse outgoing wiki and markdown link references from the body (vault-internal only — external URLs are filtered)
-- `format: "document-map"` — catalog of headings, block references, and frontmatter fields
-- `format: "section"` — single heading/block/frontmatter section value (requires `section`); heading sections include the full subtree under that heading. The response echoes the locator the read resolved to in `sectionTarget` as a full `Parent::Child` path, and when a bare leaf name matches several headings it lists every colliding path in `candidates` — the read still returns the first match
+Vault-note and tag data are also reachable via tools — `obsidian_get_note` for `obsidian://vault/{+path}`, `obsidian_list_tags` for `obsidian://tags` (count-ranked and capped, unlike the resource's raw snapshot). `obsidian://status` has no tool equivalent. Resources exist for clients that prefer attaching a note or vault snapshot to a conversation.
 
-Pair the document-map projection with `obsidian_patch_note` to discover edit targets before patching.
+## Capability reference
 
----
+### `obsidian_get_note` <sub>tool</sub>
 
-### `obsidian_search_notes`
-
-Up to three search modes selected by `mode`:
-
-- `text` — substring match with surrounding context windows. `contextLength` controls characters of context per side of each match (default 100; bump it for more context per hit). Optional `pathPrefix` filter (text mode only — passing `pathPrefix` in any other mode is rejected with `path_prefix_invalid_mode`).
-- `jsonlogic` — JSONLogic tree evaluated against `path`, `content`, `frontmatter.<key>`, `tags`, and `stat.{ctime,mtime,size}`; custom `glob` and `regexp` operators, both taking `[PATTERN, VALUE]` — pattern first, then the field reference: `{"glob": ["Projects/*.md", {"var": "path"}]}`. The reverse order compiles the note's own field as the pattern: `glob` then matches nothing, and `regexp` fails outright on whatever the field parses as. This is also how backlinks are expressed, since there is no dedicated tool or upstream endpoint for them: `{"regexp": ["\\[\\[Target Note(\\||#|\\]\\])", {"var": "content"}]}` returns every note whose body wikilinks `Target Note`.
-- `omnisearch` — BM25-ranked search via the community [Omnisearch](https://github.com/scambier/obsidian-omnisearch) plugin. Supports quoted phrases, `-exclusion`, `path:` / `ext:` filters, typo tolerance, and PDF + OCR coverage (via [Text Extractor](https://github.com/scambier/obsidian-text-extractor)). Only present in the mode enum when the plugin's HTTP server is reachable at startup; the upstream hard-caps results at 50 — narrow the query to surface more (the response carries `truncated: true` when the cap was likely hit).
-
-Results paginate via opaque cursors per the [MCP 2025-11-25 spec](https://modelcontextprotocol.io/specification/2025-11-25/utils/pagination): omit `cursor` for the first page, then pass `nextCursor` from the prior response. Every result carries `totalCount` (post-path-policy, pre-pagination); `nextCursor` is omitted on the last page. Text-mode hits are additionally clipped per file at `maxMatchesPerHit` (default 10) so a single match-heavy note can't blow the response budget — clipped hits carry `truncated: true` and `totalMatches`.
+- `format: "content" | "full" | "document-map" | "section"` selects the projection; `full` accepts `includeLinks: true` for outgoing wiki/markdown links (vault-internal only — external URLs are filtered)
+- Addressed by vault `path`, the `active` file, or a `periodic` note (`daily` / `weekly` / `monthly` / `quarterly` / `yearly`)
+- Heading sections use `Parent::Child` syntax; a bare leaf name matching several headings returns the first match and lists every colliding path in `candidates`
+- Forgiving `path` resolution: a case-mismatched path retries against the canonical filename, an ambiguous case match fails with `Conflict`, and a `NotFound` carries `Did you mean: …?` suggestions when near-matches exist
+- Typed errors include `note_missing`, `path_forbidden`, `no_active_file`, `periodic_unsupported` / `periodic_disabled`, and `path_traversal`
 
 ---
 
-### `obsidian_write_note`
+### `obsidian_list_notes` <sub>tool</sub>
 
-Create or surgically replace, with a protective default against accidental whole-file overwrites.
-
-- Without `section` — full-file `PUT`. **Refuses to clobber an existing file** unless `overwrite: true` is set. The `file_exists` (`Conflict`) error suggests `obsidian_patch_note` / `obsidian_append_to_note` / `obsidian_replace_in_note` for in-place edits.
-- With `section` — `PATCH`-with-replace against the named heading/block/frontmatter field, leaving the rest of the file untouched. The `overwrite` flag is ignored in section mode.
-
-The output reports `created: true` when the call brought a new file into existence; `false` when it replaced an existing one or targeted a section. Every mutating tool also returns `previousSizeInBytes` and `currentSizeInBytes` so an agent can spot accidental clobbers, unexpected upstream behavior, or a typo path that landed at the wrong file.
+- Recursive walk from `path` (default vault root); `depth` 1–20 (default 2 = target plus immediate children)
+- Optional `extension` and `nameRegex` (≤256 chars, no nested quantifiers) filters; a directory failing `nameRegex` is skipped without recursing into it
+- Hard cap of 1000 entries per call — `excluded.reason: "entry_cap"` signals a truncated walk; narrow `path` or the filters to see the rest
+- Per-directory `truncated: true` marks entries cut off by the depth limit or by path policy
 
 ---
 
-### `obsidian_append_to_note`
+### `obsidian_list_tags` <sub>tool</sub>
 
-A combined upsert + section-append primitive that mirrors the upstream Local REST API behavior:
-
-- Without `section` — `POST` to `/vault/{path}`. Appends when the file exists, **creates the file with your content as the entire body when it doesn't.** The output's `created: true` flags the second branch so the agent can notice when a typo path or a not-yet-created daily note silently turned into a brand-new file.
-- With `section` — `PATCH`-with-append against the named heading, block reference, or frontmatter field. The file must exist (PATCH preflight throws `note_missing` otherwise). Pass `createTargetIfMissing: true` to bring the section itself into existence inside an existing file. Block-reference targets concatenate adjacent to the block line without a separator — include a leading newline in `content` if you want one.
-
-`previousSizeInBytes` is `0` on the upsert-create branch and the actual file size otherwise; `currentSizeInBytes` is the post-write size read from the upstream after the operation. Compare deltas against `Buffer.byteLength(content)` to detect auto-newline injection or concurrent writers.
+- Vault-wide tag counts, including hierarchical parents (`work/tasks` contributes to both `work` and `work/tasks`)
+- Ordered by count descending, capped at `limit` (default 200, max 10000); optional `nameRegex` and `minCount` narrow the candidate set before ranking
+- Reports `truncated` / `shown` / `cap` when the limit withheld results
+- Not narrowed by `OBSIDIAN_READ_PATHS` — tag names (never note contents) can surface from outside the read scope
 
 ---
 
-### `obsidian_patch_note`
+### `obsidian_list_commands` <sub>tool</sub>
 
-Surgical edits at a single document target.
-
-- `operation: "append"` adds after the section
-- `operation: "prepend"` adds before the section
-- `operation: "replace"` swaps it out
-- Targets: heading path, block reference ID, or frontmatter field
-
-Heading targets accept either the full `Parent::Child` path or a bare leaf name. A bare leaf that matches exactly one heading is expanded to its full path before the write, and the response echoes the locator the edit landed on; a leaf matching several headings is rejected with `ambiguous_section`, whose error data lists the candidate paths. The same resolution applies to `obsidian_write_note` and `obsidian_append_to_note` with `section`.
-
-Use `obsidian_get_note` with `format: "document-map"` to discover what targets exist before patching.
+- Lists Obsidian command-palette IDs and display names; optional `nameRegex` filters on display name
+- **Opt-in via `OBSIDIAN_ENABLE_COMMANDS=true`** — absent from `tools/list` when unset
+- Discovery partner for `obsidian_execute_command`
 
 ---
 
-### `obsidian_replace_in_note`
+### `obsidian_search_notes` <sub>tool</sub>
 
-Search-replace for edits that don't fit `obsidian_patch_note`'s structural targets. The note is fetched, replacements are applied sequentially (each sees the previous output), and the result is written back in a single `PUT`.
-
-`scope` selects what the replacements run over:
-
-- `body` (default) — the text after the YAML frontmatter block. The block is re-attached from the original bytes, so it comes back byte-identical.
-- `frontmatter` — only the YAML between the `---` fences. The fences themselves are never matched.
-- `both` — each replacement runs over the frontmatter and then the body; `perReplacement[]` reports `bodyCount` and `frontmatterCount` separately.
-
-With the frontmatter in scope, the rewritten YAML is re-parsed before anything is written: if it no longer parses as a mapping of properties, the call fails with `frontmatter_invalid` and the note keeps its original bytes. That check catches YAML that breaks — an unquoted `:` in a scalar, a list marker rewritten into an alias, a stray quote. It cannot catch an edit that stays well-formed while meaning something else, such as a substring collision that renames a key or a replacement that drops a scalar's quotes and changes its type. Prefer `obsidian_manage_frontmatter` for typed edits to a single property.
-
-Per-replacement options:
-
-- `useRegex` — treat `search` as an ECMAScript regex. With `useRegex: true`, the replacement honors `$1` / `$&` capture-group references.
-- `caseSensitive` — when `false`, match case-insensitively
-- `wholeWord` — wrap the pattern in `\b…\b`; works in both literal and regex modes
-- `flexibleWhitespace` — substitute any run of whitespace in `search` with `\s+`. Literal mode only — has no effect when `useRegex: true` (express it directly).
-- `replaceAll` — when `false`, only the first match is replaced. Under `scope: 'both'` that one substitution goes to the frontmatter when it matches there, and to the body otherwise.
-
-Literal mode preserves `$1` / `$&` in the replacement verbatim — only `useRegex: true` expands capture-group references.
+- `mode: "text" | "jsonlogic"` always; `"omnisearch"` is added to the schema only when the Omnisearch plugin's HTTP server is reachable at startup (restart to re-probe)
+- `text` — substring match with `contextLength`-sized context windows (default 100) and an optional `pathPrefix`; `jsonlogic` — a JSONLogic tree with `var` paths into `path` / `content` / `frontmatter.<key>` / `tags` / `stat.{ctime,mtime,size}`, plus `glob` / `regexp` operators taking `[PATTERN, VALUE]`; `omnisearch` — BM25-ranked, quoted phrases, `-exclusion`, `path:` / `ext:` filters, typo tolerance, PDF/OCR via Text Extractor, hard-capped at 50 upstream hits (`truncated: true` when likely hit)
+- Cursor pagination — omit `cursor` for page one, pass `nextCursor` from the prior response; text-mode hits additionally clip to `maxMatchesPerHit` (default 10), flagged with `truncated` / `totalMatches`
+- No dedicated backlinks tool — express "what links here" via `jsonlogic`: `{"regexp": ["\\[\\[Target Note(\\||#|\\]\\])", {"var": "content"}]}`
 
 ---
 
-### `obsidian_manage_tags`
+### `obsidian_write_note` <sub>tool</sub>
 
-Add, remove, or list tags on a note. Operates on one of two representations, defaulting to the canonical Obsidian frontmatter location:
-
-- `location: 'frontmatter'` (default) — only the frontmatter `tags:` array; the note body is left untouched
-- `location: 'inline'` — only inline `#tag` syntax in the body; `add` appends `#tag` at end-of-file
-- `location: 'both'` — opt-in reconciliation across both representations
-
-`add` ensures the tag is present in the requested location(s); `remove` strips it; `list` ignores the input `tags` array.
-
-Inline `#tag` detection skips code spans (fenced and inline), link spans (`[[...]]`, `[text](...)`, `[text][ref]`) — so a heading anchor, block anchor, or wikilink alias is never read as a tag or rewritten by a removal — and a hash escaped as `\#`. A `#` inside an HTML comment or a math span is still counted. `list` and `remove` run the same detection, so what `list` reports is what `remove` can reach.
-
-Inline mode reads and writes the note body only — a `#` inside a YAML scalar is frontmatter, so it is neither listed as an inline tag nor rewritten by a removal. Removing an inline tag takes exactly one adjacent horizontal space with it — the one before the tag, or the one after when no space precedes it; every other byte survives, including nested list indentation, four-space indented code blocks, trailing two-space hard line breaks, and table cell padding.
+- Without `section` — full-file write; refuses to clobber an existing note unless `overwrite: true` (`file_exists` conflict otherwise, naming the surgical-edit tools as the alternative)
+- With `section` — `PATCH`-with-replace against a heading/block/frontmatter target, leaving the rest of the file untouched (`overwrite` is ignored); a bare heading leaf shared by several headings fails with `ambiguous_section`
+- Output reports `created`, plus `previousSizeInBytes` / `currentSizeInBytes` on every call to spot an accidental clobber or a mistyped path
 
 ---
 
-### `obsidian_delete_note`
+### `obsidian_append_to_note` <sub>tool</sub>
 
-Permanently delete a note. The first call answers with a confirmation request rather than a deletion — the prompt includes the file's byte size, so the destructive blast radius is visible before the user confirms — and the tool is retried with the answer. Declining or cancelling fails the call with `cancelled` and issues no `DELETE`; the `destructiveHint` annotation also surfaces the operation in the host's approval flow. The output reports `previousSizeInBytes` (size at the moment of deletion) and `currentSizeInBytes: 0`.
+- Without `section` — appends to an existing file, or creates it with the given content as the whole body (`created: true` flags the second case)
+- With `section` — appends to a heading/block/frontmatter target; the file must already exist, and `createTargetIfMissing: true` brings the section itself into existence
+- Block-reference targets concatenate with no separator — include a leading newline in `content` for one
+- `previousSizeInBytes` / `currentSizeInBytes` bracket every call for drift detection
 
-The confirmation is not optional and has no fallback path: a client that cannot serve the input round-trip cannot complete a delete. Every other tool is unaffected.
+---
+
+### `obsidian_patch_note` <sub>tool</sub>
+
+- `operation: "append" | "prepend" | "replace"` against one heading, block reference, or frontmatter field per call
+- Heading targets accept the full `Parent::Child` path or an unambiguous bare leaf name; a leaf matching several headings fails with `ambiguous_section` and lists the candidates
+- `patchOptions`: `createTargetIfMissing`, `applyIfContentPreexists` (idempotency guard — otherwise `content_preexists`), `trimTargetWhitespace`
 
 ---
 
-### `obsidian_execute_command`
+### `obsidian_replace_in_note` <sub>tool</sub>
 
-Dispatch an Obsidian command-palette command by ID (discoverable via `obsidian_list_commands`). Behavior is command-dependent — some commands open UI, others delete files or close the vault.
-
-**Off by default.** When `OBSIDIAN_ENABLE_COMMANDS` is unset, both `obsidian_execute_command` and its discovery partner `obsidian_list_commands` are wrapped with `disabledTool()` — absent from `tools/list` (the LLM can't invoke them) but still visible in the operator-facing manifest with a hint to enable them.
+- One or more `replacements`, applied in array order, each over the previous one's output
+- `scope: "body"` (default, frontmatter left byte-identical) | `"frontmatter"` | `"both"`; frontmatter/both re-parse the rewritten YAML afterward and write nothing if it breaks (`frontmatter_invalid`)
+- Per-replacement options: `useRegex` (≤1024 chars, no nested quantifiers), `caseSensitive`, `wholeWord` (`\b…\b` in both modes), `flexibleWhitespace` (literal mode only), `replaceAll` (default `true`)
+- `perReplacement[]` reports `bodyCount` / `frontmatterCount` per entry; `totalReplacements` sums them
 
 ---
+
+### `obsidian_manage_frontmatter` <sub>tool</sub>
+
+- `operation: "get" | "set" | "delete"` on a single frontmatter `key`; `set` requires a JSON-typed `value` (string, number, boolean, array, or object)
+- `get` needs read access; `set` / `delete` need the path inside `OBSIDIAN_WRITE_PATHS` with `OBSIDIAN_READ_ONLY=false`
+- `set` / `delete` return the full `frontmatter` after the change plus `previousSizeInBytes` / `currentSizeInBytes`
+
+---
+
+### `obsidian_manage_tags` <sub>tool</sub>
+
+- `operation: "add" | "remove" | "list"`; `location: "frontmatter"` (default, canonical `tags:` array) | `"inline"` (body `#tag`, `add` appends at end-of-file) | `"both"` (reconciles both)
+- Inline detection skips fenced/inline code spans, link spans (`[[...]]`, `[text](...)`, `[text][ref]`), and `\#`-escaped hashes, so a heading anchor or wikilink alias is never mistaken for a tag
+- `add` / `remove` report `applied` vs. `skipped` tags plus the full `tags` set after the change; `list` ignores the input `tags` array
+
+---
+
+### `obsidian_delete_note` <sub>tool</sub>
+
+- Always asks for confirmation first — the initial call returns an elicitation request naming the file's byte size, and is retried with the answer; declining fails with `cancelled` and issues no `DELETE`
+- No API-level undo — recovery requires Obsidian's local trash
+- Requires an MCP client that can serve an elicitation round-trip; every other tool works without one
+
+---
+
+### `obsidian_open_in_ui` <sub>tool</sub>
+
+- `failIfMissing` (default `true`) controls open-vs-create: opening an existing file needs read access, opening a missing one (with `failIfMissing: false`) creates it and needs write access
+- `newLeaf` opens in a split pane instead of the active one
+- Same forgiving path resolution as `obsidian_get_note` (case fallback, `Did you mean` suggestions); `obsidian_delete_note` deliberately doesn't get it — a destructive op never silently rewrites its target
+- Output reports `createdIfMissing` so the caller can tell which branch ran
+
+---
+
+### `obsidian_execute_command` <sub>tool</sub>
+
+- Dispatches an Obsidian command-palette command by `commandId` (discover via `obsidian_list_commands`); runs with the same authority as a keyboard invocation
+- **Opt-in via `OBSIDIAN_ENABLE_COMMANDS=true`** — absent from `tools/list` when unset
+- Behavior is command-dependent — some are destructive (delete file, close vault), some open UI
+
+---
+
+### `obsidian://vault/{+path}` <sub>resource</sub>
+
+- The `{+path}` segment captures everything after `/vault/`, including slashes
+- Paths may be sent literally or percent-encoded — `Folder/Test Note.md` and `Folder/Test%20Note.md` resolve to the same note, as do non-ASCII names and a bare `%`
+- Returns the same shape as `obsidian_get_note` with `format: "full"` — content, frontmatter, tags, stat
+- Gated by `OBSIDIAN_READ_PATHS` / `OBSIDIAN_WRITE_PATHS` like the tool equivalent
+
+---
+
+### `obsidian://tags` <sub>resource</sub>
+
+- Full snapshot of the upstream `/tags/` payload — unsorted, uncapped, includes hierarchical parents
+- Not a mirror of `obsidian_list_tags`: no count-descending order, no `limit` / `nameRegex` / `minCount`
+
+---
+
+### `obsidian://status` <sub>resource</sub>
+
+- Reachability, plugin version, `authenticated` (whether the configured `OBSIDIAN_API_KEY` was accepted), and plugin manifest info
+- `apiExtensions[]` lists registered plugin extensions — check for `local-rest-api-periodic-notes` before relying on `periodic` targets on plugin v5.0.2 and later
+- Still reports reachability when the API key is misconfigured; only `authenticated` reflects the key's validity
 
 ## Path policy (folder-scoped permissions)
 
@@ -183,41 +221,24 @@ Denies are typed `path_forbidden` (JSON-RPC code `Forbidden`) with the active sc
 
 The startup banner logs the active scope so operators can verify their config at boot.
 
----
-
-## Resources
-
-| Type | URI | Description |
-|:---|:---|:---|
-| Resource | `obsidian://vault/{+path}` | A note in the vault — content, frontmatter, tags, and file metadata. |
-| Resource | `obsidian://tags` | All tags found across the vault, with usage counts. |
-| Resource | `obsidian://status` | Server reachability, auth status, plugin/Obsidian version info, and the plugin manifest. |
-
-All resource data is also reachable via tools — `obsidian_get_note` for `obsidian://vault/{+path}`, `obsidian_list_tags` for `obsidian://tags`. Resources exist for clients that prefer attaching a specific note or vault snapshot to a conversation. The tag pair is not a mirror: `obsidian://tags` keeps snapshot semantics and returns the upstream payload whole and unsorted, while `obsidian_list_tags` orders by count and caps.
-
 ## Features
 
-Built on [`@cyanheads/mcp-ts-core`](https://www.npmjs.com/package/@cyanheads/mcp-ts-core):
-
-- Declarative tool and resource definitions — single file per primitive, framework handles registration and validation
-- Unified error handling — handlers throw, framework catches, classifies, and formats. Tools advertise their failure surface via typed `errors[]` contracts.
-- Server-level `instructions` on `initialize` — surfaces deployment-specific orientation (active path policy, read-only mode, command-palette toggle) to spec-compliant clients alongside the static tool/resource catalog
-- Pluggable auth on the HTTP transport: `none`, `jwt`, `oauth`
-- Structured logging with optional OpenTelemetry tracing
-- STDIO and Streamable HTTP transports
-
-The server itself is stateless — every tool call hits the Local REST API directly. The framework's storage backends, request-state KV, and progress streams aren't used here; Obsidian is single-vault and there's nothing to persist between calls.
+Built on [`@cyanheads/mcp-ts-core`](https://github.com/cyanheads/mcp-ts-core): stdio and Streamable HTTP transports, pluggable auth (`none` / `jwt` / `oauth`), swappable storage (`in-memory`, `filesystem`, `Supabase`, `Cloudflare KV/R2/D1`), structured logging with optional OpenTelemetry tracing.
 
 Obsidian-specific:
 
 - Wraps the [Obsidian Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api) plugin — typed client, deterministic error mapping
 - Section-aware editing across headings, block references, and frontmatter fields via `PATCH`-with-target operations
-- Tag reconciliation across both representations: frontmatter `tags:` array and inline `#tag` syntax (skipping code spans, link spans, and hashes escaped as `\#`)
-- Search across up to three modes: text, JSONLogic, and (when the plugin is reachable) BM25-ranked Omnisearch — cursor-paginated per the MCP 2025-11-25 spec, with per-file match clipping in text mode
-- Required human-in-the-loop confirmation for destructive deletes — a multi-round-trip `input_required` round served on both protocol revisions, with no unconfirmed path through the tool
-- Folder-scoped read/write permissions via `OBSIDIAN_READ_PATHS` / `OBSIDIAN_WRITE_PATHS` and a global `OBSIDIAN_READ_ONLY` kill switch — denies are typed `path_forbidden` with the active scope echoed back in the error data
-- Opt-in command-palette pair (`obsidian_list_commands` + `obsidian_execute_command`) — registered only when `OBSIDIAN_ENABLE_COMMANDS=true`
-- Forgiving path resolution on `obsidian_get_note` and `obsidian_open_in_ui` — silently retries case-mismatched paths against the canonical filename, throws `Conflict` on ambiguous case matches, and enriches `NotFound` with `Did you mean: …?` suggestions when only near-matches exist. `obsidian_delete_note` is deliberately excluded — a destructive op shouldn't silently rewrite the target path.
+- Search across three modes — text, JSONLogic, and (when reachable) BM25-ranked Omnisearch — cursor-paginated per the MCP 2025-11-25 spec
+- Tag reconciliation across both representations: frontmatter `tags:` array and inline `#tag` syntax
+- Folder-scoped read/write permissions via `OBSIDIAN_READ_PATHS` / `OBSIDIAN_WRITE_PATHS` and a global `OBSIDIAN_READ_ONLY` kill switch; opt-in command-palette pair gated by `OBSIDIAN_ENABLE_COMMANDS`. Server-level `instructions` on `initialize` report the active policy to the caller
+
+Agent-friendly output:
+
+- Recovery-guided errors — every declared failure carries a `reason`, a JSON-RPC code, and a `recovery.hint` written for that case, so a rejection names what to do next instead of only what broke
+- Size-delta self-correction — every mutating tool returns `previousSizeInBytes` / `currentSizeInBytes`, so a caller can spot an accidental clobber or unexpected upstream behavior without a follow-up read
+- Ambiguity surfaced structurally — a heading leaf name shared by several headings returns `candidates` instead of silently picking one; tag operations report `applied` vs. `skipped` so a caller sees exactly what changed
+- Discriminated output contracts — `format` on `obsidian_get_note`, `operation` on `obsidian_manage_frontmatter` and `obsidian_manage_tags`, `mode` on `obsidian_search_notes` — callers branch on typed fields instead of parsing text
 
 ## Getting started
 
@@ -259,6 +280,28 @@ Or with npx (no Bun required):
 }
 ```
 
+Or with Docker:
+
+```json
+{
+  "mcpServers": {
+    "obsidian-mcp-server": {
+      "type": "stdio",
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-e", "MCP_TRANSPORT_TYPE=stdio",
+        "-e", "MCP_LOG_LEVEL=info",
+        "-e", "OBSIDIAN_API_KEY=your-local-rest-api-key",
+        "ghcr.io/cyanheads/obsidian-mcp-server:latest"
+      ]
+    }
+  }
+}
+```
+
+The default `OBSIDIAN_BASE_URL` (`http://127.0.0.1:27123`) points at the container's own loopback, not your host — add `-e OBSIDIAN_BASE_URL=http://host.docker.internal:27123` (Docker Desktop) or run with `--network host` (Linux) so the container can reach the plugin.
+
 For Streamable HTTP, set the transport and start the server. Inline env vars work for one-off runs; for repeated use, copy values into `.env` (see [`.env.example`](./.env.example)) and run `bun run start:http`.
 
 ```sh
@@ -268,11 +311,11 @@ MCP_TRANSPORT_TYPE=http OBSIDIAN_API_KEY=... bun run start:http
 
 ### Prerequisites
 
-- [Bun v1.3.0](https://bun.sh/) or higher (or Node.js v24+).
+- [Bun v1.4.0](https://bun.sh/) or higher (or Node.js v24+).
 - The [Obsidian Local REST API](https://github.com/coddingtonbear/obsidian-local-rest-api) plugin, **v4.0.0 through v5.x**, installed and enabled in your vault. Generate an API key in **Settings → Community Plugins → Local REST API** and copy it into `OBSIDIAN_API_KEY`. Plugin v6.0 removes the markdown-patch 1.x wire format this server pins for section-targeted writes and the document map.
 - Periodic-note targets (`target: { "type": "periodic" }`) work across that whole range: natively on plugin **v5.0.1 and earlier**, and on **v5.0.2 and later** — which moved the `/periodic/` routes out of the plugin — once the companion [periodic-notes API extension](https://github.com/coddingtonbear/obsidian-local-rest-api-periodic-notes) is installed. Without that extension on v5.0.2+, periodic targets fail with a `periodic_unsupported` error naming it; `obsidian://status` lists the registered extensions if you want to check first. Every other target type is unaffected.
 - An MCP client that can answer an input request (elicitation). `obsidian_delete_note` always asks for confirmation before deleting, so a client without that support can read and write notes but cannot delete one.
-- This server defaults to `http://127.0.0.1:27123` for simplicity. Enable **"Non-encrypted (HTTP) Server"** in the plugin settings to use it. To use the always-on HTTPS port instead, set `OBSIDIAN_BASE_URL=https://127.0.0.1:27124`; the plugin's self-signed cert is handled by `OBSIDIAN_VERIFY_SSL=false` (the default).
+- This server defaults to `http://127.0.0.1:27123` for simplicity. Enable **"Non-encrypted (HTTP) Server"** in the plugin settings to use it. To use the always-on HTTPS port instead, set `OBSIDIAN_BASE_URL=https://127.0.0.1:27124`; the plugin's self-signed cert is handled by `OBSIDIAN_VERIFY_SSL=false` (the default), which relaxes verification for this server's requests to that endpoint only.
 
 ### Installation
 
@@ -306,8 +349,8 @@ MCP_TRANSPORT_TYPE=http OBSIDIAN_API_KEY=... bun run start:http
 | Variable | Description | Default |
 |:---------|:------------|:--------|
 | `OBSIDIAN_API_KEY` | **Required.** Bearer token for the Obsidian Local REST API plugin. | — |
-| `OBSIDIAN_BASE_URL` | Base URL of the Local REST API plugin. Use `https://127.0.0.1:27124` for the always-on HTTPS port (self-signed cert). | `http://127.0.0.1:27123` |
-| `OBSIDIAN_VERIFY_SSL` | Verify the TLS certificate. Default `false` because the plugin uses a self-signed cert. On Node, the dispatcher's `rejectUnauthorized` option handles this without any process-wide change. On Bun, the runtime ignores that option, so the service additionally sets `NODE_TLS_REJECT_UNAUTHORIZED=0` — that fallback is scoped to Bun only. | `false` |
+| `OBSIDIAN_BASE_URL` | Base URL of the Local REST API plugin. Use `https://127.0.0.1:27124` for the always-on HTTPS port (self-signed cert). A trailing slash is stripped at startup. | `http://127.0.0.1:27123` |
+| `OBSIDIAN_VERIFY_SSL` | Verify the TLS certificate. Default `false` because the plugin uses a self-signed cert. The relaxation is applied per request, to an `https:` `OBSIDIAN_BASE_URL` only — every other HTTPS connection the process makes still verifies normally, on both Bun and Node. | `false` |
 | `OBSIDIAN_REQUEST_TIMEOUT_MS` | Per-request timeout in milliseconds. | `30000` |
 | `OBSIDIAN_ENABLE_COMMANDS` | Opt-in flag for the command-palette pair (`obsidian_list_commands` + `obsidian_execute_command`). Off by default — Obsidian commands are opaque and can be destructive. | `false` |
 | `OBSIDIAN_READ_PATHS` | Comma-separated vault-relative folder allowlist for read operations. Prefix-based with implicit recursion; case-insensitive; trailing slashes normalized. Unset = full vault. Write paths are implicitly readable. | unset |
@@ -318,7 +361,7 @@ MCP_TRANSPORT_TYPE=http OBSIDIAN_API_KEY=... bun run start:http
 | `MCP_HTTP_HOST` | Host for the HTTP server. | `127.0.0.1` |
 | `MCP_HTTP_PORT` | Port for the HTTP server. | `3010` |
 | `MCP_HTTP_ENDPOINT_PATH` | Endpoint path for the JSON-RPC handler. | `/mcp` |
-| `MCP_SESSION_MODE` | Session handling for the HTTP transport: `stateless`, `stateful`, or `auto`. Pinned to `stateful` — `obsidian_delete_note` confirms via an elicitation round, which `stateless` disables. | `stateful` |
+| `MCP_SESSION_MODE` | Session handling for the HTTP transport: `stateless`, `stateful`, or `auto`. Defaults to `stateful` here — `obsidian_delete_note` confirms via an elicitation round, and under `stateless` a 2025-era client's round is refused (`client_capability_missing`). | `stateful` |
 | `MCP_PUBLIC_URL` | Public origin override for TLS-terminating reverse-proxy deployments (landing page, Server Card, RFC 9728 metadata). | unset |
 | `MCP_AUTH_MODE` | Auth mode: `none`, `jwt`, or `oauth`. | `none` |
 | `MCP_AUTH_SECRET_KEY` | **Required when `MCP_AUTH_MODE=jwt`.** ≥32-char shared secret used to verify incoming JWTs. | — |
@@ -360,7 +403,7 @@ docker build -t obsidian-mcp-server .
 docker run --rm -e OBSIDIAN_API_KEY=your-key -p 3010:3010 obsidian-mcp-server
 ```
 
-The Dockerfile defaults to HTTP transport, stateless session mode, and logs to `/var/log/obsidian-mcp-server`. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
+The Dockerfile defaults to HTTP transport, stateful session mode (required for the `obsidian_delete_note` confirmation round), and logs to `/var/log/obsidian-mcp-server`. Point `OBSIDIAN_BASE_URL` at `http://host.docker.internal:27123` (Docker Desktop) or run with `--network host` (Linux) so the container reaches the plugin on your host. OpenTelemetry peer dependencies are installed by default — build with `--build-arg OTEL_ENABLED=false` to omit them.
 
 The image binds to `0.0.0.0` inside the container (required for Docker port mapping). For any deployment reachable beyond your own machine, set `MCP_AUTH_MODE=jwt` (with `MCP_AUTH_SECRET_KEY`) or `oauth` — otherwise the listener forwards your `OBSIDIAN_API_KEY` to the vault on behalf of every caller.
 
@@ -391,7 +434,7 @@ See [`CLAUDE.md`](./CLAUDE.md) for development guidelines and architectural rule
 
 Bugs, feature requests, and documentation gaps belong in an issue — see [CONTRIBUTING.md](.github/CONTRIBUTING.md) for what makes one actionable, and [CODE_OF_CONDUCT.md](.github/CODE_OF_CONDUCT.md) for how we work together. Security reports go through [SECURITY.md](.github/SECURITY.md), never a public issue.
 
-Pull requests are welcome for small, self-contained fixes. Run checks and tests before submitting:
+Run checks and tests before submitting:
 
 ```sh
 bun run devcheck

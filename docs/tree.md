@@ -1,6 +1,6 @@
 # obsidian-mcp-server - Directory Structure
 
-Generated on: 2026-09-09 11:42:42
+Generated on: 2026-09-19 15:38:41
 
 ```text
 obsidian-mcp-server/
@@ -14,6 +14,8 @@ obsidian-mcp-server/
 │   │   ├── bug_report.yml
 │   │   ├── config.yml
 │   │   └── feature_request.yml
+│   ├── workflows/
+│   │   └── codeql.yml
 │   ├── CODE_OF_CONDUCT.md
 │   ├── CONTRIBUTING.md
 │   ├── FUNDING.yml
@@ -31,24 +33,7 @@ obsidian-mcp-server/
 │   └── template.md
 ├── docs/
 │   └── openapi.yaml
-├── scripts/
-│   ├── build-changelog.ts
-│   ├── build.ts
-│   ├── check-dependency-specifiers.ts
-│   ├── check-docs-sync.ts
-│   ├── check-framework-antipatterns.ts
-│   ├── check-skill-versions.ts
-│   ├── check-skills-sync.ts
-│   ├── clean-mcpb.ts
-│   ├── clean.ts
-│   ├── devcheck.ts
-│   ├── lint-mcp.ts
-│   ├── lint-packaging.ts
-│   ├── list-skills.ts
-│   ├── release-github.ts
-│   ├── split-changelog.ts
-│   └── tree.ts
-├── skills/
+├── framework-skills/
 │   ├── add-app-tool/
 │   │   └── SKILL.md
 │   ├── add-prompt/
@@ -135,6 +120,23 @@ obsidian-mcp-server/
 │   │   └── SKILL.md
 │   └── tool-defs-analysis/
 │       └── SKILL.md
+├── scripts/
+│   ├── build-changelog.ts
+│   ├── build.ts
+│   ├── check-dependency-specifiers.ts
+│   ├── check-docs-sync.ts
+│   ├── check-framework-antipatterns.ts
+│   ├── check-skill-versions.ts
+│   ├── check-skills-sync.ts
+│   ├── clean-mcpb.ts
+│   ├── clean.ts
+│   ├── devcheck.ts
+│   ├── lint-mcp.ts
+│   ├── lint-packaging.ts
+│   ├── list-skills.ts
+│   ├── release-github.ts
+│   ├── split-changelog.ts
+│   └── tree.ts
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -180,14 +182,19 @@ obsidian-mcp-server/
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
+│   ├── integration/
+│   │   └── delete-note-confirmation.test.ts
 │   ├── resources/
 │   │   ├── obsidian-status.test.ts
 │   │   ├── obsidian-tags.test.ts
 │   │   └── obsidian-vault-note.test.ts
 │   ├── services/
 │   │   ├── frontmatter-ops.test.ts
+│   │   ├── obsidian-service-base-url.test.ts
+│   │   ├── obsidian-service-close.test.ts
 │   │   ├── obsidian-service-error-containment.test.ts
 │   │   ├── obsidian-service-path-policy.test.ts
+│   │   ├── obsidian-service-tls.test.ts
 │   │   ├── obsidian-service.test.ts
 │   │   ├── path-policy.test.ts
 │   │   └── section-extractor.test.ts
