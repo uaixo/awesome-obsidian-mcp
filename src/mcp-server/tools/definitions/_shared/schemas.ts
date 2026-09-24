@@ -95,7 +95,9 @@ const PatchOptionsShape = z.object({
   trimTargetWhitespace: z
     .boolean()
     .default(false)
-    .describe('Trim whitespace from the target section before applying the operation.'),
+    .describe(
+      'Trim whitespace from the target section before applying the operation. Honored by Local REST API v4.x only; v5.0 and later place the blank lines around inserted content themselves and ignore it.',
+    ),
 });
 
 /** Input-facing patch options: tolerates a JSON-string-encoded object. */
