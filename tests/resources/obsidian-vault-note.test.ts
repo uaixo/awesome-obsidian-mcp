@@ -40,7 +40,7 @@ describe('obsidian://vault/{+path}', () => {
     expect(out.tags).toEqual(['t']);
   });
 
-  it('surfaces 404 as NotFound', async () => {
+  it('surfaces 404 as NotFound with reason note_missing', async () => {
     harness
       .current()
       .pool.intercept({ path: '/vault/Missing.md', method: 'GET' })
@@ -54,7 +54,10 @@ describe('obsidian://vault/{+path}', () => {
           uri: new URL('obsidian://vault/Missing.md'),
         }),
       ),
-    ).rejects.toMatchObject({ code: JsonRpcErrorCode.NotFound });
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      data: { reason: 'note_missing' },
+    });
   });
 
   /**
@@ -136,10 +139,11 @@ describe('obsidian://vault/{+path}', () => {
       ),
     ).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
-      data: {
-        reason: 'path_is_directory',
-        recovery: { hint: expect.stringContaining('obsidian_list_notes') },
-      },
+      data: { reason: 'path_is_directory' },
     });
+    // The resource handler factory fills this declared recovery onto the wire.
+    expect(
+      obsidianVaultNote.errors?.find((e) => e.reason === 'path_is_directory')?.recovery,
+    ).toContain('obsidian_list_notes');
   });
 });
