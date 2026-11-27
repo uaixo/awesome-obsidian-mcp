@@ -10,6 +10,11 @@
  * the depth limit cut off recursion. Drill deeper by passing a higher `depth`,
  * narrowing with `path`, or filtering with `extension`/`nameRegex`.
  *
+ * Under OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS, `ObsidianService.listFiles`
+ * returns only readable entries and the folders on the way to the scope, and
+ * lists those folders when asked — so the walk descends into everything it is
+ * handed, and the entry cap and totals count returned entries only.
+ *
  * Named `_notes` rather than `_files` to disambiguate from agents' generic
  * file-system tools (Read, Glob, LS) — a `_files` tool surface tempts agents
  * to fish for non-vault paths through it.
@@ -19,7 +24,13 @@
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
-import { getObsidianService, type ObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
+import {
+  getObsidianService,
+  type ObsidianService,
+  trimSlashes,
+} from '@/services/obsidian/obsidian-service.js';
+import { inlineCode } from './_shared/markdown.js';
 import { nameRegexSafetyIssue } from './_shared/regex-safety.js';
 
 const DEFAULT_DEPTH = 2;
@@ -149,9 +160,9 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'The supplied `path` is outside OBSIDIAN_READ_PATHS (root listings always pass; specific subdirectories must be readable).',
+      when: 'The supplied `path` is outside OBSIDIAN_READ_PATHS and is not a folder on the way to it, or is inside OBSIDIAN_DENY_PATHS. The vault root and the folders leading to a scoped path always list, showing only in-scope entries.',
       recovery:
-        'List a directory inside the configured read scope, or omit `path` to list from the vault root. The error data echoes the active scope.',
+        'List a directory inside the configured read scope, or omit `path` to list from the vault root. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'directory_missing',
@@ -181,7 +192,6 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
       if (safetyIssue) {
         throw ctx.fail('regex_unsafe', `Unsafe nameRegex: ${safetyIssue}`, {
           nameRegex: input.nameRegex,
-          ...ctx.recoveryFor('regex_unsafe'),
         });
       }
       try {
@@ -190,7 +200,7 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
         throw ctx.fail(
           'regex_invalid',
           `Invalid nameRegex: ${(err as Error).message}`,
-          { nameRegex: input.nameRegex, ...ctx.recoveryFor('regex_invalid') },
+          { nameRegex: input.nameRegex },
           { cause: err },
         );
       }
@@ -202,7 +212,7 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
         : `.${input.extension.toLowerCase()}`
       : undefined;
 
-    const rootDir = (input.path ?? '').replace(/^\/+|\/+$/g, '');
+    const rootDir = trimSlashes(input.path ?? '');
     const state: WalkState = { entries: [], totalFiles: 0, totalDirs: 0, cappedByEntries: false };
     await walkVault(svc, ctx, rootDir, 1, state, { depth, regex, ext });
 
@@ -232,7 +242,7 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
   },
 
   format: (result) => {
-    const headerName = result.path === '' ? '(vault root)' : result.path;
+    const headerName = result.path === '' ? '(vault root)' : escapeMarkdownInline(result.path);
     const meta = [
       `${result.totals.entries} entries`,
       `${result.totals.files} files, ${result.totals.directories} directories`,
@@ -240,9 +250,9 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
     ];
     const filterParts: string[] = [];
     if (result.appliedFilters.extension)
-      filterParts.push(`extension=\`${result.appliedFilters.extension}\``);
+      filterParts.push(`extension=${inlineCode(result.appliedFilters.extension)}`);
     if (result.appliedFilters.nameRegex)
-      filterParts.push(`nameRegex=\`${result.appliedFilters.nameRegex}\``);
+      filterParts.push(`nameRegex=${inlineCode(result.appliedFilters.nameRegex)}`);
     if (filterParts.length) meta.push(`filters: ${filterParts.join(', ')}`);
 
     const lines = [`**${headerName}** — ${meta.join(' · ')}`];
@@ -250,9 +260,12 @@ export const obsidianListNotes = tool('obsidian_list_notes', {
     if (result.entries.length === 0) {
       lines.push('', '_(empty)_');
     } else {
-      lines.push('', TYPE_LEGEND, '```');
-      lines.push(...renderTree(result.entries));
-      lines.push('```');
+      // Sized past any backtick run in an entry name, so no name can close the block.
+      lines.push(
+        '',
+        TYPE_LEGEND,
+        markdown().codeBlock(renderTree(result.entries).join('\n')).build(),
+      );
     }
 
     if (result.excluded) {
@@ -310,20 +323,13 @@ async function walkVault(
 
     const fullPath = dir ? `${dir}/${name}` : name;
     const entry: Entry = { path: fullPath, type: isDir ? 'directory' : 'file' };
-    /**
-     * Mark a subdir truncated when (a) we hit the depth cap, OR (b) policy
-     * blocks reading it — the listing surfaces it (operator can see it
-     * exists) but we don't try to walk inside, which would throw
-     * `path_forbidden` mid-walk and abort the whole listing.
-     */
-    const policyBlocked = isDir && !svc.policy.isReadable(fullPath);
-    if (isDir && (currentDepth >= opts.depth || policyBlocked)) entry.truncated = true;
+    if (isDir && currentDepth >= opts.depth) entry.truncated = true;
 
     state.entries.push(entry);
     if (isDir) state.totalDirs++;
     else state.totalFiles++;
 
-    if (isDir && currentDepth < opts.depth && !policyBlocked) {
+    if (isDir && currentDepth < opts.depth) {
       await walkVault(svc, ctx, fullPath, currentDepth + 1, state, opts);
       if (state.cappedByEntries) return;
     }

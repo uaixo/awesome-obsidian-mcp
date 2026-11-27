@@ -6,24 +6,14 @@
     "url": "https://github.com/cyanheads/obsidian-mcp-server",
     "source": "github"
   },
-  "version": "3.6.0",
+  "version": "3.9.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "obsidian-mcp-server",
-      "runtimeHint": "node",
-      "version": "3.6.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:stdio"
-        }
-      ],
+      "runtimeHint": "npx",
+      "version": "3.9.0",
       "environmentVariables": [
         {
           "name": "OBSIDIAN_API_KEY",
@@ -47,7 +37,7 @@
         },
         {
           "name": "OBSIDIAN_REQUEST_TIMEOUT_MS",
-          "description": "Per-request timeout in milliseconds.",
+          "description": "Milliseconds one request attempt (headers and body) may take before it fails with obsidian_timeout. GET, PUT, and DELETE retry a timed-out attempt; all the requests of one tool call share a 45 s budget, or this value when it is longer.",
           "format": "string",
           "isRequired": false,
           "default": "30000"
@@ -61,13 +51,19 @@
         },
         {
           "name": "OBSIDIAN_READ_PATHS",
-          "description": "Optional comma-separated vault-relative folder allowlist for reads. Prefix-based with implicit recursion; case-insensitive; trailing slashes normalized. Unset = full vault. Write paths are implicitly readable. Example: 'public/,projects/'.",
+          "description": "Optional comma-separated vault-relative folder allowlist for reads. Prefix-based with implicit recursion; case-insensitive; backslashes read as slashes, repeated and trailing slashes and '.' segments dropped, and names normalized to Unicode NFC; an entry naming the vault root ('.') is rejected at startup. Unset = full vault. Write paths are implicitly readable. Example: 'public/,projects/'.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "OBSIDIAN_WRITE_PATHS",
-          "description": "Optional comma-separated vault-relative folder allowlist for writes. Same syntax as OBSIDIAN_READ_PATHS. Unset = full vault. Example: 'projects/,scratch/'.",
+          "description": "Optional comma-separated vault-relative folder allowlist for writes. Same syntax as OBSIDIAN_READ_PATHS. Unset = full vault, or the read scope when reads are restricted; paths in OBSIDIAN_DENY_PATHS stay denied. Example: 'projects/,scratch/'.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OBSIDIAN_DENY_PATHS",
+          "description": "Optional comma-separated vault-relative paths withheld from reads and writes. Same syntax as OBSIDIAN_READ_PATHS. Wins over both allowlists; denied paths are left out of listings, search results, and tag counts. Unset = nothing denied. Example: 'private/,journal/therapy/'.",
           "format": "string",
           "isRequired": false
         },
@@ -79,8 +75,15 @@
           "default": "false"
         },
         {
+          "name": "OBSIDIAN_DELETE_ELICITATION",
+          "description": "Opt-in delete confirmation. When true, obsidian_delete_note asks the user to confirm each delete through an elicitation round (the client must support elicitation), and HTTP startup requires a stateful session unless OBSIDIAN_READ_ONLY=true disables the tool. Off by default — the delete runs on the first call, bounded by OBSIDIAN_WRITE_PATHS and OBSIDIAN_READ_ONLY.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
           "name": "OBSIDIAN_OMNISEARCH_URL",
-          "description": "Override URL for the Omnisearch plugin HTTP server. Unset derives from OBSIDIAN_BASE_URL host with port 51361. Required only if the Omnisearch plugin is not on the default port.",
+          "description": "Override URL for the Omnisearch plugin HTTP server. Unset derives from OBSIDIAN_BASE_URL host with port 51361. Required only if the Omnisearch plugin is not on the default port. Under OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS the URL is never called and the omnisearch search mode is withheld.",
           "format": "string",
           "isRequired": false
         },
@@ -100,19 +103,15 @@
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "obsidian-mcp-server",
-      "runtimeHint": "node",
-      "version": "3.6.0",
-      "packageArguments": [
-        {
-          "type": "positional",
-          "value": "run"
-        },
-        {
-          "type": "positional",
-          "value": "start:http"
-        }
-      ],
+      "runtimeHint": "npx",
+      "version": "3.9.0",
       "environmentVariables": [
+        {
+          "name": "MCP_TRANSPORT_TYPE",
+          "description": "Selects the HTTP transport.",
+          "format": "string",
+          "value": "http"
+        },
         {
           "name": "OBSIDIAN_API_KEY",
           "description": "Bearer token for the Obsidian Local REST API plugin (Settings → Community Plugins → Local REST API).",
@@ -135,7 +134,7 @@
         },
         {
           "name": "OBSIDIAN_REQUEST_TIMEOUT_MS",
-          "description": "Per-request timeout in milliseconds.",
+          "description": "Milliseconds one request attempt (headers and body) may take before it fails with obsidian_timeout. GET, PUT, and DELETE retry a timed-out attempt; all the requests of one tool call share a 45 s budget, or this value when it is longer.",
           "format": "string",
           "isRequired": false,
           "default": "30000"
@@ -149,13 +148,19 @@
         },
         {
           "name": "OBSIDIAN_READ_PATHS",
-          "description": "Optional comma-separated vault-relative folder allowlist for reads. Prefix-based with implicit recursion; case-insensitive; trailing slashes normalized. Unset = full vault. Write paths are implicitly readable. Example: 'public/,projects/'.",
+          "description": "Optional comma-separated vault-relative folder allowlist for reads. Prefix-based with implicit recursion; case-insensitive; backslashes read as slashes, repeated and trailing slashes and '.' segments dropped, and names normalized to Unicode NFC; an entry naming the vault root ('.') is rejected at startup. Unset = full vault. Write paths are implicitly readable. Example: 'public/,projects/'.",
           "format": "string",
           "isRequired": false
         },
         {
           "name": "OBSIDIAN_WRITE_PATHS",
-          "description": "Optional comma-separated vault-relative folder allowlist for writes. Same syntax as OBSIDIAN_READ_PATHS. Unset = full vault. Example: 'projects/,scratch/'.",
+          "description": "Optional comma-separated vault-relative folder allowlist for writes. Same syntax as OBSIDIAN_READ_PATHS. Unset = full vault, or the read scope when reads are restricted; paths in OBSIDIAN_DENY_PATHS stay denied. Example: 'projects/,scratch/'.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "OBSIDIAN_DENY_PATHS",
+          "description": "Optional comma-separated vault-relative paths withheld from reads and writes. Same syntax as OBSIDIAN_READ_PATHS. Wins over both allowlists; denied paths are left out of listings, search results, and tag counts. Unset = nothing denied. Example: 'private/,journal/therapy/'.",
           "format": "string",
           "isRequired": false
         },
@@ -167,8 +172,15 @@
           "default": "false"
         },
         {
+          "name": "OBSIDIAN_DELETE_ELICITATION",
+          "description": "Opt-in delete confirmation. When true, obsidian_delete_note asks the user to confirm each delete through an elicitation round (the client must support elicitation), and HTTP startup requires a stateful session unless OBSIDIAN_READ_ONLY=true disables the tool. Off by default — the delete runs on the first call, bounded by OBSIDIAN_WRITE_PATHS and OBSIDIAN_READ_ONLY.",
+          "format": "string",
+          "isRequired": false,
+          "default": "false"
+        },
+        {
           "name": "OBSIDIAN_OMNISEARCH_URL",
-          "description": "Override URL for the Omnisearch plugin HTTP server. Unset derives from OBSIDIAN_BASE_URL host with port 51361. Required only if the Omnisearch plugin is not on the default port.",
+          "description": "Override URL for the Omnisearch plugin HTTP server. Unset derives from OBSIDIAN_BASE_URL host with port 51361. Required only if the Omnisearch plugin is not on the default port. Under OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS the URL is never called and the omnisearch search mode is withheld.",
           "format": "string",
           "isRequired": false
         },

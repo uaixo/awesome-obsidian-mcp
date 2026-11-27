@@ -4,7 +4,7 @@ description: >
   File a bug or feature request against @cyanheads/mcp-ts-core when you hit a framework issue. Use when a builder, utility, context method, or config behaves contrary to the documented API — not for server-specific application bugs.
 metadata:
   author: cyanheads
-  version: "1.12"
+  version: "1.15"
   audience: external
   type: workflow
 ---
@@ -33,7 +33,8 @@ For general `gh` CLI workflows outside issue filing (PRs, workflows, API access)
 gh issue list -R cyanheads/mcp-ts-core --search "your error message or keyword" --state all
 
 # Assess a close match before commenting — is it already linked to a fix or referenced elsewhere?
-gh issue view <number> -R cyanheads/mcp-ts-core --comments
+gh issue view <number> -R cyanheads/mcp-ts-core              # body
+gh issue view <number> -R cyanheads/mcp-ts-core --comments   # thread only — without a TTY it prints no body
 gh api 'repos/cyanheads/mcp-ts-core/issues/<number>/timeline' --paginate \
   --jq '.[] | select(.event=="cross-referenced") | .source.issue | "\(.repository.full_name)#\(.number) — \(.title)"'
 ```
@@ -70,7 +71,7 @@ gh issue create -R cyanheads/mcp-ts-core --template "Bug Report" --web
 
 ### CLI (non-interactive)
 
-Structure the `--body` to match the template's form fields. Description is two or three sentences; the reproduction is the minimal code and the observed output, nothing else. Add `### Additional context` only when it changes the fix (a workaround, a related issue, the one log line that matters) — omitted by default.
+Structure the `--body` to match the template's form fields. `Environment` is the form's one-row table: the installed mcp-ts-core version from `node_modules/@cyanheads/mcp-ts-core/package.json` (not the `^` range), the runtime with its version (`bun --version`), the transport, and the OS. Description is two or three sentences; the reproduction is the minimal code and the observed output, nothing else. Add `### Additional context` only when it changes the fix (a workaround, a related issue, the one log line that matters) — omitted by default.
 
 ````bash
 gh issue create -R cyanheads/mcp-ts-core \
@@ -78,25 +79,11 @@ gh issue create -R cyanheads/mcp-ts-core \
   --label "bug" \
   --assignee "@me" \
   --body "$(cat <<'ISSUE'
-### mcp-ts-core version
+### Environment
 
-0.1.29
-
-### Runtime
-
-Bun
-
-### Runtime version
-
-Bun 1.3.x
-
-### Transport
-
-stdio
-
-### OS
-
-macOS 15.x
+| mcp-ts-core | Runtime | Transport | OS |
+|---|---|---|---|
+| 0.13.16 | Bun 1.4.4 | stdio | macOS 15.x |
 
 ### Description
 
@@ -174,7 +161,7 @@ Every issue needs exactly one primary label. Stack secondary labels on top when 
 | `regression` | Worked before, broken after an update |
 | `performance` | Memory, CPU, latency, or resource usage |
 | `security` | Vulnerability, CVE, or hardening work |
-| `breaking-change` | Fix/feature will break public API; requires a major bump |
+| `breaking-change` | Fix/feature will break public API |
 | `blocked-by-sdk` | Fix requires changes in `@modelcontextprotocol/sdk` |
 | `surplus-token-idea` | Worth exploring when token budget allows |
 
@@ -249,7 +236,8 @@ ISSUE
 ## Following Up
 
 ```bash
-# Check issue status (with comment thread)
+# Check issue status, then its comment thread (--comments without a TTY prints no body)
+gh issue view <number> -R cyanheads/mcp-ts-core
 gh issue view <number> -R cyanheads/mcp-ts-core --comments
 
 # Add context or respond to maintainer questions
@@ -267,6 +255,6 @@ gh issue list -R cyanheads/mcp-ts-core --author @me
 - [ ] If documentation or contract enhancement: confirmed `src/`, `docs/`, `framework-skills/`, and public exports don't already cover the surface
 - [ ] All secrets, credentials, and tokens redacted
 - [ ] Primary label assigned (`bug` / `enhancement` / `documentation`)
-- [ ] If bug: version, runtime, repro code, actual vs expected behavior included
+- [ ] If bug: Environment table filled in, repro code, actual vs expected behavior included
 - [ ] If feature: `Use case` and `Proposed API` present (the form's required fields), `Alternatives considered` third; Out of scope defined
 - [ ] Inside the budget — ~150 words for a bug, ~250 for a feature, code and logs excluded — and every section past the form's fields earns its place

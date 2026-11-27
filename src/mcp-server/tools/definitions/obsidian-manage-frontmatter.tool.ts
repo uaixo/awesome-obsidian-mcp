@@ -7,8 +7,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { deleteFrontmatterKey } from '@/services/obsidian/frontmatter-ops.js';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { inlineCode } from './_shared/markdown.js';
 import { TargetSchema } from './_shared/schemas.js';
 
 export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
@@ -79,8 +81,9 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: '`get` requires the path to be readable; `set`/`delete` require it to be inside OBSIDIAN_WRITE_PATHS, with OBSIDIAN_READ_ONLY=false.',
-      recovery: 'Use a path inside the configured scope. The error data echoes the active scope.',
+      when: '`get` requires the path to be readable; `set`/`delete` require it to be inside OBSIDIAN_WRITE_PATHS, with OBSIDIAN_READ_ONLY=false. A path inside OBSIDIAN_DENY_PATHS is neither.',
+      recovery:
+        'Use a path inside the configured scope. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'value_required',
@@ -175,11 +178,10 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
       if (input.value === undefined) {
         throw ctx.fail('value_required', '`value` is required when operation is "set".', {
           operation: input.operation,
-          ...ctx.recoveryFor('value_required'),
         });
       }
-      const path = await svc.resolvePath(ctx, target);
-      const pathTarget = { type: 'path' as const, path };
+      const pathTarget = await svc.resolveTarget(ctx, target);
+      const { path } = pathTarget;
       const previousSizeInBytes = await svc.getSize(ctx, pathTarget);
       await svc.patchNote(ctx, pathTarget, JSON.stringify(input.value), {
         operation: 'replace',
@@ -204,6 +206,8 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
     }
 
     const note = await svc.getNoteJson(ctx, target);
+    // The write goes to the note this read returned, never to a second resolution of `target`.
+    const pathTarget = svc.pinTarget(target, note.path);
     // Delivered bytes — not note.stat.size (see ObsidianService.tryGetSize).
     const previousSizeInBytes = Buffer.byteLength(note.content, 'utf8');
     const edit = deleteFrontmatterKey(note.content, input.key);
@@ -211,14 +215,14 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
       throw ctx.fail(
         'frontmatter_invalid',
         `Cannot delete \`${input.key}\` from ${note.path}: its frontmatter block is not safely editable — ${edit.problem}`,
-        { path: note.path, ...ctx.recoveryFor('frontmatter_invalid') },
+        { path: note.path },
       );
     }
     const newContent = edit.content;
     let currentSizeInBytes = previousSizeInBytes;
     if (newContent !== note.content) {
-      await svc.writeNote(ctx, target, newContent, 'markdown');
-      currentSizeInBytes = await svc.getSize(ctx, { type: 'path', path: note.path });
+      await svc.writeNote(ctx, pathTarget, newContent, 'markdown');
+      currentSizeInBytes = await svc.getSize(ctx, pathTarget);
     }
     const projected = { ...note.frontmatter };
     delete projected[input.key];
@@ -241,7 +245,7 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
         {
           type: 'text',
           text: [
-            `**Frontmatter ${result.operation} \`${result.key}\` in ${result.path}**`,
+            `**Frontmatter ${result.operation} ${inlineCode(result.key)} in ${escapeMarkdownInline(result.path)}**`,
             `*Exists:* ${result.exists}`,
             '*Value:*',
             valueStr,
@@ -251,7 +255,7 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
     }
     const fmKeys = Object.keys(result.frontmatter);
     const lines = [
-      `**Frontmatter ${result.operation} \`${result.key}\` in ${result.path}**`,
+      `**Frontmatter ${result.operation} ${inlineCode(result.key)} in ${escapeMarkdownInline(result.path)}**`,
       `*Size:* ${result.previousSizeInBytes} → ${result.currentSizeInBytes} bytes`,
       '',
       `**Frontmatter (${fmKeys.length} keys after change)**`,
@@ -260,7 +264,7 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
       lines.push('_(empty)_');
     } else {
       for (const k of fmKeys) {
-        lines.push(`- \`${k}\`: ${formatValue(result.frontmatter[k])}`);
+        lines.push(`- ${inlineCode(k)}: ${formatValue(result.frontmatter[k])}`);
       }
     }
     return [{ type: 'text', text: lines.join('\n') }];
@@ -269,6 +273,6 @@ export const obsidianManageFrontmatter = tool('obsidian_manage_frontmatter', {
 
 function formatValue(v: unknown): string {
   if (v === null || v === undefined) return '`null`';
-  if (typeof v === 'string') return v;
-  return `\`${JSON.stringify(v)}\``;
+  if (typeof v === 'string') return escapeMarkdownInline(v);
+  return inlineCode(JSON.stringify(v));
 }

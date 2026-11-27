@@ -11,8 +11,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { listTagsFromContent, reconcileTags } from '@/services/obsidian/frontmatter-ops.js';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { inlineCode } from './_shared/markdown.js';
 import { TargetSchema } from './_shared/schemas.js';
 
 const LocationSchema = z
@@ -96,8 +98,9 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: '`list` requires the path to be readable; `add`/`remove` require it to be inside OBSIDIAN_WRITE_PATHS, with OBSIDIAN_READ_ONLY=false.',
-      recovery: 'Use a path inside the configured scope. The error data echoes the active scope.',
+      when: '`list` requires the path to be readable; `add`/`remove` require it to be inside OBSIDIAN_WRITE_PATHS, with OBSIDIAN_READ_ONLY=false. A path inside OBSIDIAN_DENY_PATHS is neither.',
+      recovery:
+        'Use a path inside the configured scope. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'tags_required',
@@ -190,7 +193,7 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
       throw ctx.fail(
         'tags_required',
         '`tags` is required and must be non-empty for add/remove operations.',
-        { operation: input.operation, ...ctx.recoveryFor('tags_required') },
+        { operation: input.operation },
       );
     }
 
@@ -199,7 +202,7 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
       throw ctx.fail(
         'frontmatter_invalid',
         `Cannot ${input.operation} tags in ${note.path}: its frontmatter block is not safely editable — ${reconciled.problem}`,
-        { path: note.path, ...ctx.recoveryFor('frontmatter_invalid') },
+        { path: note.path },
       );
     }
     // Delivered bytes — not note.stat.size (see ObsidianService.tryGetSize).
@@ -219,8 +222,10 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
       };
     }
 
-    await svc.writeNote(ctx, target, reconciled.content, 'markdown');
-    const after = await svc.getNoteJson(ctx, target);
+    // Write and read back the note the first read returned, never a re-resolution of `target`.
+    const pathTarget = svc.pinTarget(target, note.path);
+    await svc.writeNote(ctx, pathTarget, reconciled.content, 'markdown');
+    const after = await svc.getNoteJson(ctx, pathTarget);
     // Delivered bytes — not after.stat.size (see ObsidianService.tryGetSize).
     const currentSizeInBytes = Buffer.byteLength(after.content, 'utf8');
     if (input.operation === 'add') {
@@ -252,7 +257,7 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
   format: ({ result }) => {
     if (result.operation === 'list') {
       const lines = [
-        `**Tags (operation: ${result.operation}) in ${result.path}**`,
+        `**Tags (operation: ${result.operation}) in ${escapeMarkdownInline(result.path)}**`,
         `*Frontmatter (${result.tags.frontmatter.length}):* ${formatTags(result.tags.frontmatter)}`,
         `*Inline (${result.tags.inline.length}):* ${formatTags(result.tags.inline)}`,
         `*All (${result.tags.all.length}):* ${formatTags(result.tags.all)}`,
@@ -260,7 +265,7 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
       return [{ type: 'text', text: lines.join('\n') }];
     }
     const lines = [
-      `**${result.operation === 'add' ? 'Added tags to' : 'Removed tags from'} ${result.path}** (operation: ${result.operation})`,
+      `**${result.operation === 'add' ? 'Added tags to' : 'Removed tags from'} ${escapeMarkdownInline(result.path)}** (operation: ${result.operation})`,
       `*Size:* ${result.previousSizeInBytes} → ${result.currentSizeInBytes} bytes`,
       `*Applied (${result.applied.length}):* ${formatTags(result.applied)}`,
       `*Skipped (${result.skipped.length}):* ${formatTags(result.skipped)}`,
@@ -272,5 +277,5 @@ export const obsidianManageTags = tool('obsidian_manage_tags', {
 
 function formatTags(tags: string[]): string {
   if (tags.length === 0) return '_(none)_';
-  return tags.map((t) => `\`#${t}\``).join(' ');
+  return tags.map((t) => inlineCode(`#${t}`)).join(' ');
 }

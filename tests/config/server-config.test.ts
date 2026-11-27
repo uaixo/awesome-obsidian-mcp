@@ -15,7 +15,9 @@ const ENV_KEYS = [
   'OBSIDIAN_ENABLE_COMMANDS',
   'OBSIDIAN_READ_PATHS',
   'OBSIDIAN_WRITE_PATHS',
+  'OBSIDIAN_DENY_PATHS',
   'OBSIDIAN_READ_ONLY',
+  'OBSIDIAN_DELETE_ELICITATION',
   'OBSIDIAN_OMNISEARCH_URL',
 ] as const;
 
@@ -44,6 +46,7 @@ describe('getServerConfig', () => {
       writePaths: undefined,
       readOnly: false,
     });
+    expect(config.denyPaths).toBeUndefined();
   });
 
   it('coerces "true"/"1" to boolean true', () => {
@@ -59,9 +62,13 @@ describe('getServerConfig', () => {
     vi.stubEnv('OBSIDIAN_API_KEY', 'k');
     vi.stubEnv('OBSIDIAN_VERIFY_SSL', 'no');
     vi.stubEnv('OBSIDIAN_ENABLE_COMMANDS', 'off');
+    vi.stubEnv('OBSIDIAN_READ_ONLY', '0');
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', 'false');
     const config = getServerConfig();
     expect(config.verifySsl).toBe(false);
     expect(config.enableCommands).toBe(false);
+    expect(config.readOnly).toBe(false);
+    expect(config.deleteElicitation).toBe(false);
   });
 
   it('rejects unrecognized boolean strings at startup', () => {
@@ -74,6 +81,16 @@ describe('getServerConfig', () => {
     vi.stubEnv('OBSIDIAN_API_KEY', 'k');
     vi.stubEnv('OBSIDIAN_REQUEST_TIMEOUT_MS', '12345');
     expect(getServerConfig().requestTimeoutMs).toBe(12345);
+  });
+
+  it('accepts OBSIDIAN_REQUEST_TIMEOUT_MS up to the longest timer delay, and rejects one past it', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_REQUEST_TIMEOUT_MS', '2147483647');
+    expect(getServerConfig().requestTimeoutMs).toBe(2_147_483_647);
+    resetServerConfig();
+    // A timer past 2^31 - 1 ms fires after 1 ms on both runtimes, timing out every request.
+    vi.stubEnv('OBSIDIAN_REQUEST_TIMEOUT_MS', '2147483648');
+    expect(() => getServerConfig()).toThrow(/OBSIDIAN_REQUEST_TIMEOUT_MS/);
   });
 
   it('honors a custom OBSIDIAN_BASE_URL', () => {
@@ -182,6 +199,58 @@ describe('OBSIDIAN_READ_PATHS / OBSIDIAN_WRITE_PATHS — separator parity with P
     vi.stubEnv('OBSIDIAN_READ_PATHS', 'foo/bar,foo\\bar,FOO\\BAR');
     expect(getServerConfig().readPaths).toEqual(['foo/bar']);
   });
+});
+
+/**
+ * A prefix is stored in the form a vault path reaches the plugin in: no empty
+ * or `.` segments, NFC. Kept verbatim, `./private` or `Journal//Therapy` names
+ * a prefix no vault path matches — a refusal for an allowlist, and a deny
+ * entry that denies nothing.
+ */
+describe('path lists — stored the way vault paths reach the plugin', () => {
+  it('drops `.` segments and collapses repeated separators', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_READ_PATHS', './Private,Journal//Therapy,a/./b\\\\c/');
+    expect(getServerConfig().readPaths).toEqual(['private', 'journal/therapy', 'a/b/c']);
+  });
+
+  it('stores an NFD spelling as NFC, deduplicating the two', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_WRITE_PATHS', `${'Café'.normalize('NFD')},${'café'.normalize('NFC')}`);
+    expect(getServerConfig().writePaths).toEqual(['café'.normalize('NFC')]);
+  });
+
+  it.each([['.'], ['./'], ['./.']])('rejects %j, which names the vault root', (value) => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_DENY_PATHS', value);
+    expect(() => getServerConfig()).toThrow(/OBSIDIAN_DENY_PATHS.*vault root/);
+  });
+});
+
+describe('OBSIDIAN_DENY_PATHS', () => {
+  it('parses with the allowlist parser', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_DENY_PATHS', ' Private/ ,, Journal\\Therapy,private');
+    expect(getServerConfig().denyPaths).toEqual(['private', 'journal/therapy']);
+  });
+
+  it('treats empty, whitespace-only, and placeholder values as unset', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    for (const value of ['', '   ', `\${user_config.OBSIDIAN_DENY_PATHS}`]) {
+      resetServerConfig();
+      vi.stubEnv('OBSIDIAN_DENY_PATHS', value);
+      expect(getServerConfig().denyPaths, value).toBeUndefined();
+    }
+  });
+
+  it.each([[',,'], ['/private'], ['notes/../private']])(
+    'rejects %j, naming the variable',
+    (value) => {
+      vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+      vi.stubEnv('OBSIDIAN_DENY_PATHS', value);
+      expect(() => getServerConfig()).toThrow(/OBSIDIAN_DENY_PATHS/);
+    },
+  );
 });
 
 /**
@@ -304,9 +373,32 @@ describe('OBSIDIAN_READ_ONLY', () => {
     vi.stubEnv('OBSIDIAN_READ_ONLY', '1');
     expect(getServerConfig().readOnly).toBe(true);
   });
+});
 
-  it('defaults to false', () => {
+describe('OBSIDIAN_DELETE_ELICITATION', () => {
+  it('defaults to false when unset or empty', () => {
     vi.stubEnv('OBSIDIAN_API_KEY', 'k');
-    expect(getServerConfig().readOnly).toBe(false);
+    expect(getServerConfig().deleteElicitation).toBe(false);
+    resetServerConfig();
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', '');
+    expect(getServerConfig().deleteElicitation).toBe(false);
+  });
+
+  it('coerces "true"/"1" to true and "false" to false', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', 'true');
+    expect(getServerConfig().deleteElicitation).toBe(true);
+    resetServerConfig();
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', '1');
+    expect(getServerConfig().deleteElicitation).toBe(true);
+    resetServerConfig();
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', 'false');
+    expect(getServerConfig().deleteElicitation).toBe(false);
+  });
+
+  it('rejects an unrecognized value at startup, naming the variable', () => {
+    vi.stubEnv('OBSIDIAN_API_KEY', 'k');
+    vi.stubEnv('OBSIDIAN_DELETE_ELICITATION', 'ask');
+    expect(() => getServerConfig()).toThrow(/OBSIDIAN_DELETE_ELICITATION/);
   });
 });

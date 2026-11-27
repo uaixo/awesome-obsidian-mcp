@@ -1,6 +1,6 @@
 # obsidian-mcp-server - Directory Structure
 
-Generated on: 2026-09-23 19:17:20
+Generated on: 2026-11-11 08:31:39
 
 ```text
 obsidian-mcp-server/
@@ -31,6 +31,9 @@ obsidian-mcp-server/
 │   ├── 3.4.x/
 │   ├── 3.5.x/
 │   ├── 3.6.x/
+│   ├── 3.7.x/
+│   ├── 3.8.x/
+│   ├── 3.9.x/
 │   └── template.md
 ├── docs/
 │   └── openapi.yaml
@@ -42,6 +45,8 @@ obsidian-mcp-server/
 │   ├── add-resource/
 │   │   └── SKILL.md
 │   ├── add-service/
+│   │   └── SKILL.md
+│   ├── add-skill/
 │   │   └── SKILL.md
 │   ├── add-test/
 │   │   └── SKILL.md
@@ -132,12 +137,17 @@ obsidian-mcp-server/
 │   ├── clean-mcpb.ts
 │   ├── clean.ts
 │   ├── devcheck.ts
+│   ├── install-otel.ts
 │   ├── lint-mcp.ts
 │   ├── lint-packaging.ts
 │   ├── list-skills.ts
+│   ├── prune-musl-packages.ts
 │   ├── release-github.ts
 │   ├── split-changelog.ts
 │   └── tree.ts
+├── skills/
+│   └── obsidian-guide/
+│       └── SKILL.md
 ├── src/
 │   ├── config/
 │   │   └── server-config.ts
@@ -154,6 +164,7 @@ obsidian-mcp-server/
 │   │   └── tools/
 │   │       └── definitions/
 │   │           ├── _shared/
+│   │           │   ├── markdown.ts
 │   │           │   ├── regex-safety.ts
 │   │           │   ├── schemas.ts
 │   │           │   └── suggest-paths.ts
@@ -175,13 +186,18 @@ obsidian-mcp-server/
 │   ├── services/
 │   │   └── obsidian/
 │   │       ├── frontmatter-ops.ts
+│   │       ├── jsonlogic-deps.d.ts
+│   │       ├── jsonlogic-evaluator.ts
+│   │       ├── jsonlogic-worker.ts
 │   │       ├── markdown-blocks.ts
 │   │       ├── obsidian-service.ts
 │   │       ├── patch-instruction.ts
 │   │       ├── path-policy.ts
 │   │       ├── section-extractor.ts
+│   │       ├── simple-search.ts
 │   │       └── types.ts
-│   └── index.ts
+│   ├── index.ts
+│   └── instructions.ts
 ├── tests/
 │   ├── config/
 │   │   └── server-config.test.ts
@@ -195,22 +211,27 @@ obsidian-mcp-server/
 │   │       ├── overlap.json
 │   │       ├── probe-body.md
 │   │       ├── repeated.json
+│   │       ├── rule-captures.json
 │   │       ├── simulate.ts
 │   │       ├── surrogate.json
 │   │       └── three-word.json
 │   ├── integration/
-│   │   └── delete-note-confirmation.test.ts
+│   │   ├── delete-note-confirmation.test.ts
+│   │   ├── omnisearch-read-scope.test.ts
+│   │   └── published-skills.test.ts
 │   ├── resources/
 │   │   ├── obsidian-status.test.ts
 │   │   ├── obsidian-tags.test.ts
 │   │   └── obsidian-vault-note.test.ts
 │   ├── services/
 │   │   ├── frontmatter-ops.test.ts
+│   │   ├── jsonlogic-evaluator.test.ts
 │   │   ├── obsidian-service-base-url.test.ts
 │   │   ├── obsidian-service-close.test.ts
 │   │   ├── obsidian-service-error-containment.test.ts
 │   │   ├── obsidian-service-patch-format.test.ts
 │   │   ├── obsidian-service-path-policy.test.ts
+│   │   ├── obsidian-service-timeout.test.ts
 │   │   ├── obsidian-service-tls.test.ts
 │   │   ├── obsidian-service-unreachable.test.ts
 │   │   ├── obsidian-service.test.ts
@@ -237,6 +258,7 @@ obsidian-mcp-server/
 │   │   ├── path-error-contracts.test.ts
 │   │   ├── periodic-error-contracts.test.ts
 │   │   └── suggest-paths.test.ts
+│   ├── helpers.test.ts
 │   ├── helpers.ts
 │   └── instructions.test.ts
 ├── .dockerignore
@@ -254,7 +276,9 @@ obsidian-mcp-server/
 ├── Dockerfile
 ├── LICENSE
 ├── manifest.json
+├── mcp.json
 ├── package.json
+├── plugin.json
 ├── README.md
 ├── server.json
 ├── tsconfig.build.json

@@ -4,7 +4,7 @@ description: >
   Scaffold a new MCP resource definition. Use when the user asks to add a resource, expose data via URI, or create a readable endpoint.
 metadata:
   author: cyanheads
-  version: "1.6"
+  version: "1.10"
   audience: external
   type: reference
 ---
@@ -22,7 +22,7 @@ Resources use the `resource()` builder from `@cyanheads/mcp-ts-core`. Each resou
 3. **Create the file** at `src/mcp-server/resources/definitions/{{resource-name}}.resource.ts`
 4. **Register** the resource in the project's existing `createApp()` resource list (directly in `src/index.ts` for fresh scaffolds, or via a barrel if the repo already has one)
 5. **Run `bun run devcheck`** to verify
-6. **Smoke-test** with `bun run rebuild && bun run start:stdio` (or `start:http`)
+6. **Smoke-test** with `bun run rebuild && bun run start:stdio < /dev/null` (or `start:http`) — the `Core services constructed` log record must list the new resource in its `resources` field (the message text shows only counts); if it doesn't, the resource never reached `createApp()`
 
 ## Template
 
@@ -63,12 +63,12 @@ export const {{RESOURCE_EXPORT}} = resource('{{scheme}}://{{{paramName}}}/data',
 
 ### With pagination
 
-For resources that return large result sets, include `cursor` in the URI template params and use opaque cursor pagination in the `handler`. The cursor arrives as a validated URI param. `paginateArray` requires a `RequestContext` for logging — create one from `requestContextService`:
+For resources that return large result sets, use opaque cursor pagination in the `handler`. `resources/read` carries no cursor of its own, so the cursor must be a URI template variable — it arrives as a validated URI param. Make it a path segment: a `{?cursor}` query expansion is mandatory in the SDK's template matcher, so the bare URI (no `?cursor=`) stops matching. Serve the first page from an unpaged sibling resource that returns `nextCursor`, or disclose truncation in the body and point callers at a tool that pages. `paginateArray` requires a `RequestContext` for logging — create one from `requestContextService`:
 
 ```typescript
 import { extractCursor, paginateArray, requestContextService } from '@cyanheads/mcp-ts-core/utils';
 
-// URI template: '{{scheme}}://{{{paramName}}}/items'
+// URI template: '{{scheme}}://{{{paramName}}}/items/{cursor}'
 params: z.object({
   {{paramName}}: z.string().describe('{{PARAM_DESCRIPTION}}'),
   cursor: z.string().optional().describe('Opaque pagination cursor'),
@@ -103,10 +103,12 @@ await createApp({
 });
 ```
 
-If the repo already uses `src/mcp-server/resources/definitions/index.ts`, add the export to that barrel instead:
+If the repo already uses `src/mcp-server/resources/definitions/index.ts`, add the resource to that barrel the way it holds the existing ones — it must end up in the array passed to `createApp()`. A bare `export … from` line registers nothing on its own. The standard barrel shape:
 
 ```typescript
-export { {{RESOURCE_EXPORT}} } from './{{resource-name}}.resource.js';
+import { {{RESOURCE_EXPORT}} } from './{{resource-name}}.resource.js';
+
+export const allResourceDefinitions = [/* existing resources */, {{RESOURCE_EXPORT}}];
 ```
 
 ### Optional: declarative `errors[]` contract
@@ -164,6 +166,27 @@ export const itemResource = resource('items://{itemId}', {
 
 Only applies to templated resources (URI templates with `{variable}` syntax). Static URIs don't support completion.
 
+### Percent-encoded template variables
+
+A handler receives each URI template variable exactly as the request URI carries it: reading `items://§ 141.61` hands it `itemId: '%C2%A7%20141.61'`, whether the client sent the URI encoded or raw. Opt in to decoding once, server-wide:
+
+```typescript
+await createApp({ resources: [itemResource], decodeResourceParams: true });
+```
+
+Each matched variable is then decoded once, before `params` validation and whether or not the definition declares `params`, inverting the SDK's encoding for its operator:
+
+| Operator | Decoded with | `%2F` becomes |
+|:---------|:-------------|:--------------|
+| `{v}`, `{.v}`, `{/v}`, `{?v}`, `{&v}` | `decodeURIComponent` | `/` |
+| `{+v}`, `{#v}` | `decodeURI` | `%2F` (reserved-character escapes stay encoded) |
+
+Each element of an exploded variable (`{ids*}`) is decoded, and `+` stays `+`. A malformed escape (`%E0%A4%A`) refuses the read as a `params` rejection does: `-32007` with `data.issues` naming the variable. `ctx.uri` keeps the request URI as matched, and completion callbacks still receive the client's argument values. `createWorkerHandler` takes the same option.
+
+Turning the switch on and deleting the handler's own `decodeURIComponent` are one change: a handler that keeps decoding decodes twice, so `100%2541` becomes `100A` and `100%25` makes its own decode throw.
+
+A decoded value can hold `/`, `..`, `?`, and `#`: encode it again (`encodeURIComponent`) before placing it in an upstream URL, and constrain it with a `params` pattern before it names a file path, since `..` encodes to itself.
+
 ### Other `resource()` options
 
 Beyond `description`, `params`, `handler`, and `list`, the builder also supports:
@@ -171,10 +194,10 @@ Beyond `description`, `params`, `handler`, and `list`, the builder also supports
 | Field | Purpose |
 |:------|:--------|
 | `name` | Short human-readable name for `resources/list`. Defaults to a slug derived from the URI template if omitted. |
-| `output` | Optional Zod schema for runtime validation of the handler return value (parity with `tool()`'s `output`). |
+| `output` | Optional Zod schema the handler's return is parsed against once, before `format()` (parity with `tool()`'s `output`): the handler returns the schema's input type (`z.input`), and `format()` receives the parsed value. |
 | `format` | Optional formatter mapping the handler's return to the `ReadResourceResult.contents[]` shape. Default: string passthrough; objects serialized to JSON. Override when you need to attach permissions, custom encodings, or split into multiple content items. |
 | `annotations` | Resource annotations (e.g., `audience`, `priority`) — see `ResourceAnnotations`. |
-| `title` | Human-readable display title (defaults to `name`). |
+| `title` | Human-readable display title (defaults to `name`). On a template it names the template in `resources/templates/list`; the entries its `list()` returns never inherit it, so set `title` on an entry to give it one, or the client shows the entry's `name`. Those entries do inherit the template's `description`, `mimeType`, `annotations`, `size`, `examples`, and `_meta` unless they set their own. |
 | `examples` | Array of `{ name, uri }` example entries surfaced in `resources/list` for discoverability. |
 | `complete` | Per-variable completion callbacks for URI template variables. Keys match template variable names. Enables `completion/complete` and the `completions` capability. |
 | `cacheHint` | `{ ttlMs?, cacheScope? }` — how long a client may cache this resource's `resources/read` result on protocol revision 2026-07-28. See below. |
@@ -222,4 +245,4 @@ Cacheable operations are `tools/list`, `prompts/list`, `resources/list`, `resour
 - [ ] Pagination used for large result sets (`extractCursor`/`paginateArray`) — applies to both `handler` data and `list()` catalogs with many entries
 - [ ] Registered in the project's existing `createApp()` resource list (directly or via barrel)
 - [ ] `bun run devcheck` passes
-- [ ] Smoke-tested with `bun run rebuild && bun run start:stdio` (or `start:http`)
+- [ ] Smoke-tested with `bun run rebuild && bun run start:stdio < /dev/null` (or `start:http`); the `Core services constructed` record lists the new resource in its `resources` field

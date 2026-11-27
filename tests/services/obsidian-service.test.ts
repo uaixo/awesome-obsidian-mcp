@@ -6,10 +6,15 @@
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
-import { JsonRpcErrorCode, type McpError } from '@cyanheads/mcp-ts-core/errors';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { encodeVaultPath, ObsidianService } from '@/services/obsidian/obsidian-service.js';
+import {
+  encodeVaultPath,
+  ObsidianService,
+  trimSlashes,
+} from '@/services/obsidian/obsidian-service.js';
+import type { NoteTarget } from '@/services/obsidian/types.js';
 import {
   loadCapture,
   PROBE_BODY,
@@ -20,9 +25,12 @@ import {
 import {
   documentMapV2,
   type HeadingTree,
+  installMovingTargetVault,
   instructionOf,
+  MOVING_TARGET_NOTES,
   makeTestConfig,
   mockResponse,
+  NON_PATH_TARGETS,
   noteJson,
   type PathMatcher,
   type ReplyFn,
@@ -227,11 +235,15 @@ function serveV1HeadingReads(headings: string[], content: string): void {
 }
 
 describe('ObsidianService.patchNote header building (plugin v4.x)', () => {
-  it('emits Operation, Target-Type, URL-encoded Target, Target-Delimiter, and option flags', async () => {
+  /**
+   * Plugin v4.x ignores `Markdown-Patch-Version`; stating the format anyway
+   * keeps a 1.x request unambiguous on any plugin that reads it.
+   */
+  it('emits Markdown-Patch-Version: 1, Operation, Target-Type, URL-encoded Target, Target-Delimiter, and option flags', async () => {
     let seenHeaders: Record<string, string> = {};
     serveV1HeadingReads(['Top', 'Top::Sub Title'], '# Top\n## Sub Title\n');
     pool.intercept({ path: '/vault/N.md', method: 'PATCH' }).reply((opts) => {
-      seenHeaders = (opts.headers as Record<string, string>) ?? {};
+      seenHeaders = lowerCased(opts.headers);
       return { statusCode: 200, data: '' };
     });
 
@@ -245,52 +257,23 @@ describe('ObsidianService.patchNote header building (plugin v4.x)', () => {
       contentType: 'markdown',
     });
 
-    expect(seenHeaders.operation ?? seenHeaders.Operation).toBe('append');
-    expect(seenHeaders['target-type'] ?? seenHeaders['Target-Type']).toBe('heading');
-    expect(seenHeaders.target ?? seenHeaders.Target).toBe(encodeURIComponent('Top::Sub Title'));
-    expect(seenHeaders['target-delimiter'] ?? seenHeaders['Target-Delimiter']).toBe('::');
-    expect(seenHeaders['create-target-if-missing'] ?? seenHeaders['Create-Target-If-Missing']).toBe(
-      'true',
-    );
+    expect(seenHeaders['markdown-patch-version']).toBe('1');
+    expect(seenHeaders.operation).toBe('append');
+    expect(seenHeaders['target-type']).toBe('heading');
+    expect(seenHeaders.target).toBe(encodeURIComponent('Top::Sub Title'));
+    expect(seenHeaders['target-delimiter']).toBe('::');
+    expect(seenHeaders['create-target-if-missing']).toBe('true');
     // applyIfContentPreexists: true → no Reject header (force-apply, even if duplicate).
-    expect(
-      seenHeaders['reject-if-content-preexists'] ?? seenHeaders['Reject-If-Content-Preexists'],
-    ).toBeUndefined();
-    expect(seenHeaders['trim-target-whitespace'] ?? seenHeaders['Trim-Target-Whitespace']).toBe(
-      'true',
-    );
-    expect(seenHeaders['content-type'] ?? seenHeaders['Content-Type']).toBe('text/markdown');
-  });
-
-  /**
-   * Plugin v4.x ignores the header; stating the format anyway keeps a 1.x
-   * request unambiguous on any plugin that reads it.
-   */
-  it('pins Markdown-Patch-Version: 1 on every 1.x PATCH', async () => {
-    let seenHeaders: Record<string, string> = {};
-    serveV1HeadingReads(['Top', 'Top::Child'], '# Top\n## Child\n');
-    pool.intercept({ path: '/vault/N.md', method: 'PATCH' }).reply((opts) => {
-      seenHeaders = (opts.headers as Record<string, string>) ?? {};
-      return { statusCode: 200, data: '' };
-    });
-
-    await service.patchNote(ctx, { type: 'path', path: 'N.md' }, 'body', {
-      operation: 'append',
-      targetType: 'heading',
-      target: 'Top::Child',
-      contentType: 'markdown',
-    });
-
-    expect(seenHeaders['markdown-patch-version'] ?? seenHeaders['Markdown-Patch-Version']).toBe(
-      '1',
-    );
+    expect(seenHeaders['reject-if-content-preexists']).toBeUndefined();
+    expect(seenHeaders['trim-target-whitespace']).toBe('true');
+    expect(seenHeaders['content-type']).toBe('text/markdown');
   });
 
   it('sends Reject-If-Content-Preexists by default to preserve idempotency under retries', async () => {
     let seenHeaders: Record<string, string> = {};
     servePluginVersion(pool, '4.2.0');
     pool.intercept({ path: '/vault/N.md', method: 'PATCH' }).reply((opts) => {
-      seenHeaders = (opts.headers as Record<string, string>) ?? {};
+      seenHeaders = lowerCased(opts.headers);
       return { statusCode: 200, data: '' };
     });
 
@@ -303,12 +286,10 @@ describe('ObsidianService.patchNote header building (plugin v4.x)', () => {
 
     expect(seenHeaders['create-target-if-missing']).toBeUndefined();
     expect(seenHeaders['trim-target-whitespace']).toBeUndefined();
-    expect(seenHeaders['content-type'] ?? seenHeaders['Content-Type']).toBe('application/json');
+    expect(seenHeaders['content-type']).toBe('application/json');
     // Protective default — preserves the historical idempotent-by-default behavior
     // under the renamed/inverted markdown-patch 1.0 flag.
-    expect(
-      seenHeaders['reject-if-content-preexists'] ?? seenHeaders['Reject-If-Content-Preexists'],
-    ).toBe('true');
+    expect(seenHeaders['reject-if-content-preexists']).toBe('true');
   });
 });
 
@@ -334,38 +315,24 @@ describe('ObsidianService.patchNote on the 1.x header protocol', () => {
 });
 
 describe('ObsidianService.getDocumentMap (plugin v4.x)', () => {
-  it('returns a flat 1.x map as the plugin sent it', async () => {
-    servePluginVersion(pool, '4.2.0');
-    pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply(200, {
+  it('pins Markdown-Patch-Version: 1 and returns the flat `::`-joined map as the plugin sent it', async () => {
+    const flat = {
       headings: ['Top', 'Top::Child', '::Untitled child'],
       blocks: ['abc123', 'def456'],
       frontmatterFields: ['title', 'tags'],
-    });
-
-    await expect(service.getDocumentMap(ctx, { type: 'path', path: 'N.md' })).resolves.toEqual({
-      headings: ['Top', 'Top::Child', '::Untitled child'],
-      blocks: ['abc123', 'def456'],
-      frontmatterFields: ['title', 'tags'],
-    });
-  });
-
-  it('pins Markdown-Patch-Version: 1 so the flat `::`-joined map comes back', async () => {
+    };
     let seenHeaders: Record<string, string> = {};
     servePluginVersion(pool, '4.2.0');
     pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply((opts) => {
-      seenHeaders = (opts.headers as Record<string, string>) ?? {};
-      return { statusCode: 200, data: documentMap(['Top', 'Top::Child']) };
+      seenHeaders = lowerCased(opts.headers);
+      return { statusCode: 200, data: flat };
     });
 
-    const map = await service.getDocumentMap(ctx, { type: 'path', path: 'N.md' });
-
-    expect(seenHeaders['markdown-patch-version'] ?? seenHeaders['Markdown-Patch-Version']).toBe(
-      '1',
+    await expect(service.getDocumentMap(ctx, { type: 'path', path: 'N.md' })).resolves.toEqual(
+      flat,
     );
-    expect(seenHeaders.accept ?? seenHeaders.Accept).toBe(
-      'application/vnd.olrapi.document-map+json',
-    );
-    expect(map.headings).toEqual(['Top', 'Top::Child']);
+    expect(seenHeaders['markdown-patch-version']).toBe('1');
+    expect(seenHeaders.accept).toBe('application/vnd.olrapi.document-map+json');
   });
 });
 
@@ -398,16 +365,22 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
 
   /**
    * Answer the reads a heading write makes on plugin v5.x before its PATCH:
-   * the version report and the markdown-patch 2.0 document map. Any other
-   * read fails the test.
+   * the version report, the markdown-patch 2.0 document map, and — for a
+   * write to a heading the note has — one read of `note`, which the write
+   * checks for repeated link definitions. Any other read fails the test.
    */
-  function serveMap(headings: HeadingTree): void {
+  function serveMap(headings: HeadingTree, note?: string): void {
     servePluginVersion(pool, '5.2.0');
     pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply((opts) => {
       const headers = lowerCased(opts.headers);
       expect(headers.accept).toBe('application/vnd.olrapi.document-map+json');
       expect(headers['markdown-patch-version']).toBe('2');
       return { statusCode: 200, data: documentMapV2(headings) };
+    });
+    if (note === undefined) return;
+    pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply((opts) => {
+      expect(lowerCased(opts.headers).accept).toBe('application/vnd.olrapi.note+json');
+      return { statusCode: 200, data: noteJson('N.md', note) };
     });
   }
 
@@ -421,7 +394,7 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
     });
 
   it('expands a uniquely-matching bare leaf to its full Parent::Child path', async () => {
-    serveMap({ Top: { Child: {}, Sibling: {} } });
+    serveMap({ Top: { Child: {}, Sibling: {} } }, '# Top\n## Child\n## Sibling\n');
     const patched = capturePatchTarget();
 
     await expect(patch('Sibling')).resolves.toBe('Top::Sibling');
@@ -429,7 +402,7 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
   });
 
   it('prefers an exact map entry over expanding it as a leaf', async () => {
-    serveMap({ Top: {}, Other: { Top: {} } });
+    serveMap({ Top: {}, Other: { Top: {} } }, '# Top\n# Other\n## Top\n');
     const patched = capturePatchTarget();
 
     await expect(patch('Top')).resolves.toBe('Top');
@@ -460,25 +433,31 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
   });
 
   it('sends a locator that already carries the delimiter unexpanded', async () => {
-    serveMap({ Top: { Child: {} }, Child: {} });
+    serveMap({ Top: { Child: {} }, Child: {} }, '# Top\n## Child\n# Child\n');
     const patched = capturePatchTarget();
 
     await expect(patch('Top::Child')).resolves.toBe('Top::Child');
     expect(patched.seen()).toBe('Top::Child');
   });
 
-  it('expands a leaf and counts its repeats from a single read', async () => {
-    let reads = 0;
+  it('expands a leaf and counts its repeats from a single map read, reading the note once', async () => {
+    const reads = { map: 0, note: 0 };
     servePluginVersion(pool, '5.2.0');
-    pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply(() => {
-      reads++;
-      return { statusCode: 200, data: documentMapV2({ Top: { Child: {} } }) };
-    });
+    for (let i = 0; i < 2; i++) {
+      pool.intercept({ path: '/vault/N.md', method: 'GET' }).reply((opts) => {
+        if (lowerCased(opts.headers).accept === 'application/vnd.olrapi.note+json') {
+          reads.note++;
+          return { statusCode: 200, data: noteJson('N.md', '# Top\n## Child\n') };
+        }
+        reads.map++;
+        return { statusCode: 200, data: documentMapV2({ Top: { Child: {} } }) };
+      });
+    }
     const patched = capturePatchTarget();
 
     await expect(patch('Child')).resolves.toBe('Top::Child');
     expect(patched.seen()).toBe('Top::Child');
-    expect(reads).toBe(1);
+    expect(reads).toEqual({ map: 1, note: 1 });
   });
 
   /**
@@ -525,8 +504,8 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
    */
   describe('a heading path that repeats in the note', () => {
     it('writes a full path that occurs once', async () => {
-      // # Root / ## Dup / ## Other
-      serveMap({ Root: { Dup: {}, Other: {} } });
+      // The 2.0 map alone counts the repeats; the note's single read checks its link definitions.
+      serveMap({ Root: { Dup: {}, Other: {} } }, '# Root\n## Dup\n## Other\n');
       const patched = capturePatchTarget();
 
       await expect(patch('Root::Dup')).resolves.toBe('Root::Dup');
@@ -534,8 +513,7 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
     });
 
     it('writes a root-level exact map entry whose leaf also sits under a parent', async () => {
-      // # X / ## Dup / # Dup
-      serveMap({ X: { Dup: {} }, Dup: {} });
+      serveMap({ X: { Dup: {} }, Dup: {} }, '# X\n## Dup\n# Dup\n');
       const patched = capturePatchTarget();
 
       await expect(patch('Dup')).resolves.toBe('Dup');
@@ -619,33 +597,6 @@ describe('ObsidianService.patchNote heading-leaf resolution', () => {
 
       const err = await rejectionOf(patch('Dup'));
       expect(err.message).toContain("Heading 'Dup' occurs 18 times");
-    });
-
-    /**
-     * The plugin's parser reads none of these second `## Dup` lines as a
-     * heading — one continues a list item, the others sit inside an HTML
-     * block — so the map lists `Root::Dup` once and the PATCH lands on the only
-     * heading there is. A line-based scan of the body counts two.
-     */
-    it.each([
-      ['a heading line after an HTML line', '# Root\n## Dup\na\n\n<br>\n## Dup\n'],
-      ['a heading line continuing a list item', '# Root\n## Dup\na\n\n- item\n  ## Dup\n'],
-      ['a heading line inside an HTML comment', '# Root\n## Dup\na\n\n<!--\n## Dup\n\nold\n-->\n'],
-    ])('writes a path the plugin parses once, beside %s', async (_label, _note) => {
-      serveMap({ Root: { Dup: {} } });
-      const patched = capturePatchTarget();
-
-      await expect(patch('Root::Dup')).resolves.toBe('Root::Dup');
-      expect(patched.seen()).toBe('Root::Dup');
-    });
-
-    it('rejects a path that repeats through a setext heading', async () => {
-      // # Root / ## Dup / a / (blank) / Dup / ---
-      serveMap({ Root: { Dup: {}, [repeatKey('Dup', 1)]: {} } });
-
-      await expect(patch('Root::Dup')).rejects.toMatchObject({
-        data: { reason: 'ambiguous_section', candidates: ['Root::Dup', 'Root::Dup'] },
-      });
     });
 
     /**
@@ -815,15 +766,12 @@ describe('ObsidianService error classification', () => {
       .intercept({ path: '/vault/x.md', method: 'GET' })
       .reply(400, { message: 'plugin-said-gk29xb' });
 
-    const err = await service
-      .getNoteContent(ctx, { type: 'path', path: 'x.md' })
-      .then(() => undefined)
-      .catch((e: McpError) => e);
+    const err = await rejectionOf(service.getNoteContent(ctx, { type: 'path', path: 'x.md' }));
 
-    expect(err?.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
     // The path is the caller's own and stays; the plugin's wording does not.
-    expect(err?.message).toContain('x.md');
-    expect(err?.message).not.toContain('plugin-said-gk29xb');
+    expect(err.message).toContain('x.md');
+    expect(err.message).not.toContain('plugin-said-gk29xb');
   });
 
   it('classifies the 1.x invalid-target 400 as section_target_missing', async () => {
@@ -847,6 +795,99 @@ describe('ObsidianService error classification', () => {
     });
   });
 
+  /**
+   * On a case-insensitive filesystem, Obsidian's `Vault.create` refuses a
+   * whole-file write to a path its case-sensitive index does not hold when the
+   * disk already has the file under another spelling — Local REST API 5.2.0
+   * answers HTTP 500 with this body. Queued four deep so a retry would be
+   * counted rather than surfacing as a missing intercept.
+   */
+  describe('500 "File already exists" on a whole-file write', () => {
+    const fileExistsBody = {
+      message: 'Internal Server Error\nFile already exists.',
+      errorCode: 50000,
+    };
+
+    /** Queue the same 500 reply four deep; the returned function counts the requests that reached it. */
+    function queue500(method: 'GET' | 'POST' | 'PUT', path: string, data: object): () => number {
+      let attempts = 0;
+      for (let i = 0; i < 4; i++) {
+        pool.intercept({ path, method }).reply(() => {
+          attempts++;
+          return { statusCode: 500, data };
+        });
+      }
+      return () => attempts;
+    }
+
+    it.each([
+      ['a PUT', 'PUT', () => service.writeNote(ctx, { type: 'path', path: 'Notes/Case.md' }, 'x')],
+      [
+        'a POST append',
+        'POST',
+        () => service.appendToNote(ctx, { type: 'path', path: 'Notes/Case.md' }, 'y'),
+      ],
+    ] as const)(
+      'classifies %s as Conflict case_variant_exists and sends it once',
+      async (_label, method, call) => {
+        const attempts = queue500(method, '/vault/Notes/Case.md', fileExistsBody);
+
+        const err = await rejectionOf(call());
+
+        expect(attempts()).toBe(1);
+        expect(err.code).toBe(JsonRpcErrorCode.Conflict);
+        // The caller's path and the reason, nothing derived from the upstream body.
+        expect(err.data).toEqual({ path: 'Notes/Case.md', reason: 'case_variant_exists' });
+        expect(err.message).toContain('Notes/Case.md');
+        expect(err.message).not.toContain('Internal Server Error');
+      },
+    );
+
+    it.each([
+      [
+        'any other 500 on a PUT',
+        'PUT',
+        { message: 'Internal Server Error\nEBUSY' },
+        () => service.writeNote(ctx, { type: 'path', path: 'N.md' }, 'x'),
+      ],
+      [
+        'the phrase inside other text on a PUT',
+        'PUT',
+        {
+          message: "Internal Server Error\nEEXIST: file already exists, mkdir '/v/Notes/a.md'",
+          errorCode: 50000,
+        },
+        () => service.writeNote(ctx, { type: 'path', path: 'N.md' }, 'x'),
+      ],
+      [
+        'the same body on a note read',
+        'GET',
+        fileExistsBody,
+        () => service.getNoteContent(ctx, { type: 'path', path: 'N.md' }),
+      ],
+    ] as const)('leaves %s as ServiceUnavailable, retried', async (_label, method, data, call) => {
+      const attempts = queue500(method, '/vault/N.md', data);
+
+      const err = await rejectionOf(call());
+
+      expect(attempts()).toBe(4);
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.data).toMatchObject({ status: 500 });
+      expect(err.data?.reason).toBeUndefined();
+    });
+
+    it('leaves the same 500 on a command POST as ServiceUnavailable', async () => {
+      pool
+        .intercept({ path: '/commands/file-explorer%3Anew-file/', method: 'POST' })
+        .reply(500, fileExistsBody);
+
+      const err = await rejectionOf(service.executeCommand(ctx, 'file-explorer:new-file'));
+
+      expect(err.code).toBe(JsonRpcErrorCode.ServiceUnavailable);
+      expect(err.data?.reason).toBeUndefined();
+    });
+  });
+
   it('routes 500 through the framework helper as ServiceUnavailable', async () => {
     // GET is retry-safe and ServiceUnavailable is transient, so the call
     // exhausts its budget — queue one reply per attempt rather than a single
@@ -859,17 +900,6 @@ describe('ObsidianService error classification', () => {
       {
         code: JsonRpcErrorCode.ServiceUnavailable,
         message: expect.stringContaining('Obsidian Local REST API'),
-      },
-    );
-  });
-
-  it('routes 501 as ServiceUnavailable carrying the retryable opt-out', async () => {
-    pool.intercept({ path: '/vault/x.md', method: 'GET' }).reply(501, { message: 'nope' });
-
-    await expect(service.getNoteContent(ctx, { type: 'path', path: 'x.md' })).rejects.toMatchObject(
-      {
-        code: JsonRpcErrorCode.ServiceUnavailable,
-        data: { status: 501, retryable: false },
       },
     );
   });
@@ -906,9 +936,10 @@ describe('ObsidianService search', () => {
       return { statusCode: 200, data: [] };
     });
 
-    await service.searchJsonLogic(ctx, { glob: ['*.md', { var: 'path' }] });
+    const logic = { glob: ['*.md', { var: 'path' }] };
+    await service.searchJsonLogic(ctx, logic);
     expect(seenContentType).toBe('application/vnd.olrapi.jsonlogic+json');
-    expect(seenBody).toContain('"glob"');
+    expect(JSON.parse(seenBody)).toEqual(logic);
   });
 });
 
@@ -1031,37 +1062,23 @@ describe('ObsidianService.searchText / offsets across surrogate-pair window edge
   });
 });
 
+/** Each intercept matches one exact URL, so any other query string finds no intercept and rejects. */
 describe('ObsidianService.openInUi', () => {
   it('sends newLeaf=true as a query param when requested', async () => {
-    let seenPath = '';
-    pool
-      .intercept({
-        path: (p) => {
-          seenPath = p as string;
-          return seenPath.startsWith('/open/');
-        },
-        method: 'POST',
-      })
-      .reply(200, '');
+    pool.intercept({ path: '/open/Folder/Note.md?newLeaf=true', method: 'POST' }).reply(200, '');
 
-    await service.openInUi(ctx, 'Folder/Note.md', { newLeaf: true });
-    expect(seenPath).toContain('newLeaf=true');
+    await expect(
+      service.openInUi(ctx, 'Folder/Note.md', { newLeaf: true }),
+    ).resolves.toBeUndefined();
   });
 
-  it('omits the query string when newLeaf is false/undefined', async () => {
-    let seenPath = '';
-    pool
-      .intercept({
-        path: (p) => {
-          seenPath = p as string;
-          return seenPath.startsWith('/open/');
-        },
-        method: 'POST',
-      })
-      .reply(200, '');
+  it.each([
+    ['undefined', undefined],
+    ['false', { newLeaf: false }],
+  ] as const)('omits the query string when newLeaf is %s', async (_l, opts) => {
+    pool.intercept({ path: '/open/Folder/Note.md', method: 'POST' }).reply(200, '');
 
-    await service.openInUi(ctx, 'Folder/Note.md');
-    expect(seenPath.endsWith('Folder/Note.md')).toBe(true);
+    await expect(service.openInUi(ctx, 'Folder/Note.md', opts)).resolves.toBeUndefined();
   });
 });
 
@@ -1097,10 +1114,10 @@ describe('ObsidianService.tryGetSize / getSize', () => {
     );
   });
 
-  it('rejects non-integer or negative Content-Length values', async () => {
+  it.each(['not-a-number', '1.5', '-5'])('rejects a Content-Length of %j', async (length) => {
     pool
       .intercept({ path: '/vault/N.md', method: 'HEAD' })
-      .reply(200, '', { headers: { 'content-length': 'not-a-number' } });
+      .reply(200, '', { headers: { 'content-length': length } });
 
     await expect(service.tryGetSize(ctx, { type: 'path', path: 'N.md' })).rejects.toThrow(
       /invalid Content-Length/,
@@ -1135,17 +1152,15 @@ describe('ObsidianService directory guard on note reads', () => {
   const listing = { files: ['a.md', 'b.md', 'nested/'] };
   const listingHeaders = { 'content-type': 'application/json; charset=utf-8' };
 
+  /** `data` carries no recovery of its own — the framework fills the calling tool's contract hint. */
   it('getNoteContent rejects a folder listing instead of returning it as the body', async () => {
     pool.intercept({ path: '/vault/Inbox', method: 'GET' }).reply(200, listing, {
       headers: listingHeaders,
     });
 
-    await expect(
-      service.getNoteContent(ctx, { type: 'path', path: 'Inbox' }),
-    ).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'path_is_directory', path: 'Inbox' },
-    });
+    const err = await rejectionOf(service.getNoteContent(ctx, { type: 'path', path: 'Inbox' }));
+    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.data).toEqual({ path: 'Inbox', reason: 'path_is_directory' });
   });
 
   it('getNoteJson rejects a folder listing', async () => {
@@ -1205,30 +1220,6 @@ describe('ObsidianService directory guard on note reads', () => {
     );
 
     expect(await svc.tryGetSize(ctx, { type: 'path', path: 'data.json' })).toBe(19);
-  });
-
-  it('carries the contract recovery hint when the caller declares path_is_directory', async () => {
-    pool
-      .intercept({ path: '/vault/Inbox', method: 'GET' })
-      .reply(200, listing, { headers: listingHeaders });
-    const contractCtx = createMockContext({
-      errors: [
-        {
-          reason: 'path_is_directory',
-          code: JsonRpcErrorCode.ValidationError,
-          when: 'folder',
-          recovery: 'Call obsidian_list_notes with this path to list the folder.',
-        },
-      ],
-    });
-
-    await expect(
-      service.getNoteContent(contractCtx, { type: 'path', path: 'Inbox' }),
-    ).rejects.toMatchObject({
-      data: {
-        recovery: { hint: 'Call obsidian_list_notes with this path to list the folder.' },
-      },
-    });
   });
 
   it('serves a vault .json file — application/json with a filename — as a normal note', async () => {
@@ -1311,15 +1302,15 @@ describe('ObsidianService file guard on directory listings', () => {
     'content-disposition': 'attachment; filename="Note.md"',
   };
 
+  /** `data` carries no recovery of its own — the framework fills the calling tool's contract hint. */
   it('listFiles rejects a file path instead of parsing its body as a listing', async () => {
     pool.intercept({ path: '/vault/Note.md/', method: 'GET' }).reply(200, '# hello', {
       headers: fileHeaders,
     });
 
-    await expect(service.listFiles(ctx, 'Note.md')).rejects.toMatchObject({
-      code: JsonRpcErrorCode.ValidationError,
-      data: { reason: 'path_is_file', path: 'Note.md' },
-    });
+    const err = await rejectionOf(service.listFiles(ctx, 'Note.md'));
+    expect(err.code).toBe(JsonRpcErrorCode.ValidationError);
+    expect(err.data).toEqual({ path: 'Note.md', reason: 'path_is_file' });
   });
 
   /**
@@ -1338,28 +1329,6 @@ describe('ObsidianService file guard on directory listings', () => {
     await expect(service.listFiles(ctx, 'data.json')).rejects.toMatchObject({
       code: JsonRpcErrorCode.ValidationError,
       data: { reason: 'path_is_file' },
-    });
-  });
-
-  it('carries the calling tool contract recovery for path_is_file', async () => {
-    pool
-      .intercept({ path: '/vault/Note.md/', method: 'GET' })
-      .reply(200, '# hello', { headers: fileHeaders });
-    const contractCtx = createMockContext({
-      errors: [
-        {
-          reason: 'path_is_file',
-          code: JsonRpcErrorCode.ValidationError,
-          when: 'file',
-          recovery: 'Read it with obsidian_get_note, or list the parent folder instead.',
-        },
-      ],
-    });
-
-    await expect(service.listFiles(contractCtx, 'Note.md')).rejects.toMatchObject({
-      data: {
-        recovery: { hint: 'Read it with obsidian_get_note, or list the parent folder instead.' },
-      },
     });
   });
 
@@ -1576,24 +1545,20 @@ describe('ObsidianService path-traversal enforcement', () => {
     });
   });
 
-  it('rejects patchNote (header-encoded target) traversal — POSIX', async () => {
+  it.each([
+    ['POSIX', FS_TRAVERSAL],
+    ['Windows', WIN_TRAVERSAL],
+  ])('rejects patchNote traversal — %s', async (_label, path) => {
     await expect(
-      service.patchNote(ctx, { type: 'path', path: FS_TRAVERSAL }, 'body', {
+      service.patchNote(ctx, { type: 'path', path }, 'body', {
         operation: 'append',
         targetType: 'heading',
         target: 'H',
       }),
-    ).rejects.toMatchObject({ code: JsonRpcErrorCode.ValidationError });
-  });
-
-  it('rejects patchNote traversal — Windows', async () => {
-    await expect(
-      service.patchNote(ctx, { type: 'path', path: WIN_TRAVERSAL }, 'body', {
-        operation: 'append',
-        targetType: 'heading',
-        target: 'H',
-      }),
-    ).rejects.toMatchObject({ code: JsonRpcErrorCode.ValidationError });
+    ).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'path_traversal' },
+    });
   });
 
   describe('legitimate cross-platform paths still flow through to fetch', () => {
@@ -1623,6 +1588,21 @@ describe('ObsidianService path-traversal enforcement', () => {
         service.getNoteContent(ctx, { type: 'path', path: 'notes/🚀.md' }),
       ).resolves.toBe('# rocket');
     });
+  });
+});
+
+describe('trimSlashes', () => {
+  it.each([
+    ['an empty path', '', ''],
+    ['a lone slash', '/', ''],
+    ['only slashes', '///', ''],
+    ['leading and trailing slashes', '//a/b//', 'a/b'],
+    ['an interior slash run', 'a///b', 'a///b'],
+    ['backslashes, which it keeps', '\\a\\', '\\a\\'],
+    ['surrounding spaces, which it keeps', ' /a/ ', ' /a/ '],
+  ])('trims %s exactly as `/^\\/+|\\/+$/g` does', (_label, path, expected) => {
+    expect(path.replace(/^\/+|\/+$/g, '')).toBe(expected);
+    expect(trimSlashes(path)).toBe(expected);
   });
 });
 
@@ -2046,9 +2026,73 @@ describe('ObsidianService retry policy', () => {
         service.getNoteContent(ctx, { type: 'path', path: 'N.md' }),
       ).rejects.toMatchObject({
         code: JsonRpcErrorCode.ServiceUnavailable,
-        data: { retryable: false },
+        data: { status: 501, retryable: false },
       });
       expect(attempts).toBe(1);
     });
+  });
+});
+
+/**
+ * A pinned target — `resolveTarget`'s result, or `pinTarget` over the path a
+ * read returned — addresses the resolved note by vault path, so later calls
+ * reach that note even after the `active` / `periodic` route has moved on.
+ */
+describe('ObsidianService — a pinned target addresses the resolved note', () => {
+  it.each(NON_PATH_TARGETS.map(([target]) => target))('%j', async (target) => {
+    const { first, second, body } = MOVING_TARGET_NOTES;
+
+    // resolveTarget, then a write.
+    const resolved = installMovingTargetVault({ readPaths: ['work'] });
+    const pinned = await resolved.service.resolveTarget(ctx, target);
+    await resolved.service.writeNote(ctx, pinned, 'new');
+    expect(pinned).toMatchObject({ type: 'path', path: first });
+    expect(resolved.requests.slice(1)).toEqual([`PUT /vault/${first}`]);
+    expect(resolved.notes[first]).toBe('new');
+    expect(resolved.notes[second]).toBe(body(second));
+
+    // pinTarget over a read, then a write and a read.
+    const read = installMovingTargetVault();
+    const note = await read.service.getNoteJson(ctx, target);
+    const repinned = read.service.pinTarget(target, note.path);
+    await read.service.writeNote(ctx, repinned, 'new');
+    await read.service.getNoteJson(ctx, repinned);
+    expect(read.requests.slice(1)).toEqual([`PUT /vault/${first}`, `GET /vault/${first}`]);
+    expect(read.notes[second]).toBe(body(second));
+  });
+
+  it('pinTarget leaves a path target as the caller sent it', () => {
+    const target = { type: 'path', path: 'Work/a.md' } as const;
+    expect(service.pinTarget(target, 'Work/a.md')).toBe(target);
+  });
+});
+
+/**
+ * `getDocumentMap` on an `active` or `periodic` target resolves it once
+ * (read-gated) and reads the map from the resolved `/vault/` path, so the map
+ * is the resolved note's even after the target has moved on.
+ */
+describe('ObsidianService.getDocumentMap — an active or periodic target is resolved once', () => {
+  it.each<[string, string, Parameters<typeof installMovingTargetVault>[0], NoteTarget]>([
+    ['no path policy', '/active/', {}, { type: 'active' }],
+    ['OBSIDIAN_READ_PATHS', '/active/', { readPaths: ['work'] }, { type: 'active' }],
+    [
+      'OBSIDIAN_READ_PATHS',
+      '/periodic/monthly/2026/10/01/',
+      { readPaths: ['work'] },
+      { type: 'periodic', period: 'monthly', date: '2026-10-01' },
+    ],
+  ])('%s, %s', async (_label, route, config, target) => {
+    const { first, second } = MOVING_TARGET_NOTES;
+    const vault = installMovingTargetVault(config);
+    vault.notes[first] = '# Work heading\n';
+    vault.notes[second] = '# Private heading\n';
+
+    await expect(vault.service.getDocumentMap(ctx, target)).resolves.toEqual({
+      headings: ['Work heading'],
+      blocks: [],
+      frontmatterFields: ['status'],
+    });
+    expect(vault.requests).toEqual([`GET ${route}`, 'GET /', `GET /vault/${first}`]);
   });
 });

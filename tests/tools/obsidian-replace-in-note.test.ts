@@ -4,10 +4,17 @@
  */
 
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
+import type { ServerConfig } from '@/config/server-config.js';
 import { obsidianReplaceInNote } from '@/mcp-server/tools/definitions/obsidian-replace-in-note.tool.js';
-import { setupHarness } from '../helpers.js';
+import type { NoteTarget } from '@/services/obsidian/types.js';
+import {
+  contractErrorOf,
+  installMovingTargetVault,
+  MOVING_TARGET_NOTES,
+  setupHarness,
+} from '../helpers.js';
 
 const harness = setupHarness();
 
@@ -462,16 +469,13 @@ describe('obsidian_replace_in_note / frontmatter validation', () => {
     async (_label, search, replace) => {
       const puts = stubReadOnly(FM_NOTE);
 
-      await expect(
-        obsidianReplaceInNote.handler(
-          obsidianReplaceInNote.input.parse({
-            target: { type: 'path', path: 'N.md' },
-            scope: 'both',
-            replacements: [{ search, replace }],
-          }),
-          createMockContext({ errors: obsidianReplaceInNote.errors }),
-        ),
-      ).rejects.toMatchObject({
+      expect(
+        await contractErrorOf(obsidianReplaceInNote, {
+          target: { type: 'path', path: 'N.md' },
+          scope: 'both',
+          replacements: [{ search, replace }],
+        }),
+      ).toMatchObject({
         code: JsonRpcErrorCode.ValidationError,
         data: {
           reason: 'frontmatter_invalid',
@@ -523,20 +527,28 @@ describe('obsidian_replace_in_note / format()', () => {
     if (!render) throw new Error('obsidian_replace_in_note declares no format()');
     const text = render({
       path: 'N.md',
-      totalReplacements: 3,
-      perReplacement: [{ search: 'draft', count: 3, bodyCount: 2, frontmatterCount: 1 }],
+      totalReplacements: 4,
+      perReplacement: [
+        { search: 'draft', count: 3, bodyCount: 2, frontmatterCount: 1 },
+        { search: 'todo', count: 1, bodyCount: 1, frontmatterCount: 0 },
+      ],
       previousSizeInBytes: 10,
       currentSizeInBytes: 12,
     })
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
 
-    expect(text).toContain('N.md');
-    expect(text).toContain('3');
-    expect(text).toContain('body 2');
-    expect(text).toContain('frontmatter 1');
-    expect(text).toContain('10');
-    expect(text).toContain('12');
+    expect(text).toBe(
+      [
+        '**Replaced in N.md**',
+        '*Total replacements:* 4',
+        '*Size:* 10 → 12 bytes',
+        '',
+        '**Per replacement**',
+        '- `draft` → 3 matches (body 2, frontmatter 1)',
+        '- `todo` → 1 match (body 1, frontmatter 0)',
+      ].join('\n'),
+    );
   });
 });
 
@@ -663,5 +675,42 @@ describe('obsidian_replace_in_note / empty properties block', () => {
     expect(out.perReplacement).toEqual([
       { search: 'Draft', count: 1, bodyCount: 1, frontmatterCount: 0 },
     ]);
+  });
+});
+
+/**
+ * An `active` or `periodic` target is resolved by the read; the write goes to
+ * the note that read returned even when the target has moved to another note
+ * since.
+ */
+describe('obsidian_replace_in_note writes to the note its read resolved', () => {
+  it.each<[string, NoteTarget, string, Partial<ServerConfig>]>([
+    ['active, no path policy', { type: 'active' }, '/active/', {}],
+    ['active, OBSIDIAN_READ_PATHS', { type: 'active' }, '/active/', { readPaths: ['work'] }],
+    ['daily, no path policy', { type: 'periodic', period: 'daily' }, '/periodic/daily/', {}],
+    [
+      'weekly for 2026-10-01, OBSIDIAN_READ_PATHS',
+      { type: 'periodic', period: 'weekly', date: '2026-10-01' },
+      '/periodic/weekly/2026/10/01/',
+      { readPaths: ['work'] },
+    ],
+  ])('%s', async (_label, target, route, config) => {
+    const { first, second, body } = MOVING_TARGET_NOTES;
+    const vault = installMovingTargetVault(config);
+
+    const res = await runToolContract(obsidianReplaceInNote, {
+      target,
+      replacements: [{ search: 'body of', replace: 'edited' }],
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(obsidianReplaceInNote.output.parse(res.structuredContent).path).toBe(first);
+    expect(vault.requests.filter((r) => r.startsWith('PUT '))).toEqual([`PUT /vault/${first}`]);
+    // The target route is resolved once; every other request names the pinned path.
+    expect(vault.requests.filter((r) => r !== 'GET /' && !r.includes(' /vault/'))).toEqual([
+      `GET ${route}`,
+    ]);
+    expect(vault.notes[first]).toBe(body(first).replace('body of', 'edited'));
+    expect(vault.notes[second]).toBe(body(second));
   });
 });

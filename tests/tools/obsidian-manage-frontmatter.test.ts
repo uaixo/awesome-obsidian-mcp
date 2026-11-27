@@ -6,8 +6,17 @@
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
+import type { ServerConfig } from '@/config/server-config.js';
 import { obsidianManageFrontmatter } from '@/mcp-server/tools/definitions/obsidian-manage-frontmatter.tool.js';
-import { instructionOf, servePluginVersion, setupHarness } from '../helpers.js';
+import type { NoteTarget } from '@/services/obsidian/types.js';
+import {
+  installMovingTargetVault,
+  instructionOf,
+  MOVING_TARGET_NOTES,
+  markdownText,
+  servePluginVersion,
+  setupHarness,
+} from '../helpers.js';
 
 const harness = setupHarness();
 
@@ -44,9 +53,13 @@ describe('obsidian_manage_frontmatter / get', () => {
       createMockContext({ errors: obsidianManageFrontmatter.errors }),
     );
 
-    if (out.result.operation !== 'get') throw new Error('expected get branch');
-    expect(out.result.exists).toBe(true);
-    expect(out.result.value).toBe(5);
+    expect(out.result).toEqual({
+      operation: 'get',
+      path: 'N.md',
+      key: 'priority',
+      exists: true,
+      value: 5,
+    });
   });
 
   it('reports exists=false when the key is absent', async () => {
@@ -63,9 +76,13 @@ describe('obsidian_manage_frontmatter / get', () => {
       }),
       createMockContext({ errors: obsidianManageFrontmatter.errors }),
     );
-    if (out.result.operation !== 'get') throw new Error('expected get branch');
-    expect(out.result.exists).toBe(false);
-    expect(out.result.value).toBeNull();
+    expect(out.result).toEqual({
+      operation: 'get',
+      path: 'N.md',
+      key: 'priority',
+      exists: false,
+      value: null,
+    });
   });
 });
 
@@ -107,11 +124,27 @@ describe('obsidian_manage_frontmatter / set', () => {
       createTargetIfMissing: true,
       rejectIfContentPreexists: true,
     });
-    expect(res.structuredContent).toMatchObject({
-      result: { operation: 'set', path: 'N.md', key: 'tags', frontmatter: { tags: ['a'] } },
+    const after = '---\ntags:\n  - a\n---\nbody';
+    expect(res.structuredContent).toEqual({
+      result: {
+        operation: 'set',
+        path: 'N.md',
+        key: 'tags',
+        frontmatter: { tags: ['a'] },
+        previousSizeInBytes: 50,
+        currentSizeInBytes: Buffer.byteLength(after, 'utf8'),
+      },
     });
     const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
-    expect(text).toContain('tags');
+    expect(text).toBe(
+      [
+        '**Frontmatter set `tags` in N.md**',
+        `*Size:* 50 → ${Buffer.byteLength(after, 'utf8')} bytes`,
+        '',
+        '**Frontmatter (1 keys after change)**',
+        '- `tags`: `["a"]`',
+      ].join('\n'),
+    );
   });
 
   it('PATCHes the frontmatter field with JSON content type and refetches (plugin v4.x)', async () => {
@@ -206,7 +239,7 @@ describe('obsidian_manage_frontmatter / delete', () => {
     );
 
     expect(getCount).toBe(1);
-    expect(putBody).not.toContain('priority:');
+    expect(putBody).toBe(['---', 'author: casey', '---', '', 'body'].join('\n'));
     if (out.result.operation !== 'delete') throw new Error('expected delete branch');
     expect(out.result.frontmatter).toEqual({ author: 'casey' });
     expect(out.result.previousSizeInBytes).toBe(Buffer.byteLength(before, 'utf8'));
@@ -272,11 +305,17 @@ describe('obsidian_manage_frontmatter / delete refuses an unsafe frontmatter blo
     });
 
     expect(res.isError).toBe(true);
-    const error = (res.structuredContent as { error: { code: number; data: { reason: string } } })
-      .error;
+    const error = (
+      res.structuredContent as {
+        error: { code: number; message: string; data: { reason: string } };
+      }
+    ).error;
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.data.reason).toBe('frontmatter_invalid');
-    const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const text = markdownText(
+      res.content.map((b) => (b as { text?: string }).text ?? '').join('\n'),
+    );
+    expect(text).toContain(error.message);
     expect(text).toContain('not safely editable');
     expect(text).toContain(declaredRecovery('frontmatter_invalid'));
     expect(puts).toBe(0);
@@ -335,5 +374,44 @@ describe('obsidian_manage_frontmatter / dropping the block keeps body indentatio
     );
 
     expect(putBody).toBe('    indented code line\n    second line\n');
+  });
+});
+
+/**
+ * An `active` or `periodic` target is resolved by the read; the delete writes
+ * to the note that read returned even when the target has moved to another
+ * note since.
+ */
+describe('obsidian_manage_frontmatter delete writes to the note its read resolved', () => {
+  it.each<[string, NoteTarget, string, Partial<ServerConfig>]>([
+    ['active, no path policy', { type: 'active' }, '/active/', {}],
+    ['active, OBSIDIAN_READ_PATHS', { type: 'active' }, '/active/', { readPaths: ['work'] }],
+    ['daily, no path policy', { type: 'periodic', period: 'daily' }, '/periodic/daily/', {}],
+    [
+      'weekly for 2026-10-01, OBSIDIAN_READ_PATHS',
+      { type: 'periodic', period: 'weekly', date: '2026-10-01' },
+      '/periodic/weekly/2026/10/01/',
+      { readPaths: ['work'] },
+    ],
+  ])('%s', async (_label, target, route, config) => {
+    const { first, second, body } = MOVING_TARGET_NOTES;
+    const vault = installMovingTargetVault(config);
+
+    const res = await runToolContract(obsidianManageFrontmatter, {
+      target,
+      operation: 'delete',
+      key: 'status',
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(obsidianManageFrontmatter.output.parse(res.structuredContent).result.path).toBe(first);
+    expect(vault.requests.filter((r) => r.startsWith('PUT '))).toEqual([`PUT /vault/${first}`]);
+    // The target route is resolved once; every other request names the pinned path.
+    expect(vault.requests.filter((r) => r !== 'GET /' && !r.includes(' /vault/'))).toEqual([
+      `GET ${route}`,
+    ]);
+    expect(vault.notes[first]).not.toContain('status: draft');
+    expect(vault.notes[first]).toContain(`body of ${first}`);
+    expect(vault.notes[second]).toBe(body(second));
   });
 });

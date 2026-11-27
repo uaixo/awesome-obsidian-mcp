@@ -6,14 +6,17 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode, McpError } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline, markdown } from '@cyanheads/mcp-ts-core/utils';
+import { wikilinkCloser } from '@/services/obsidian/frontmatter-ops.js';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
 import {
   computeFenceMask,
   extractSection,
   type SectionExtraction,
 } from '@/services/obsidian/section-extractor.js';
+import { inlineCode } from './_shared/markdown.js';
 import { SectionSchema, SectionShape, TargetSchema } from './_shared/schemas.js';
-import { withCaseFallback } from './_shared/suggest-paths.js';
+import { discloseCaseSubstitution, withCaseFallback } from './_shared/suggest-paths.js';
 
 const StatSchema = z.object({
   ctime: z.number().describe('Created time, ms since epoch.'),
@@ -23,7 +26,7 @@ const StatSchema = z.object({
 
 export const obsidianGetNote = tool('obsidian_get_note', {
   description:
-    'Read a note from the vault — by path, the active file, or a periodic note. Choose a `format` projection: raw body, full object, structural document map, or a single section.',
+    'Read a note from the vault — by path, the active file, or a periodic note. Choose a `format` projection: raw body, full object, structural document map, or a single section. A `path` with no exact match but a single case-insensitive match in its folder reads that file instead and reports the path as sent in `requestedPath`; write and delete tools match paths exactly.',
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     format: z
@@ -71,7 +74,7 @@ export const obsidianGetNote = tool('obsidian_get_note', {
                     target: z
                       .string()
                       .describe(
-                        'Link target as written — vault path, basename, or alias. No existence check.',
+                        'Link target — a vault path or basename. A wikilink gives it as Obsidian reads it, without its `#heading` or `|alias` (`\\|alias` in a table); a markdown link gives its URL as written. No existence check.',
                       ),
                     type: z.enum(['wikilink', 'markdown']).describe('Source syntax.'),
                   })
@@ -125,11 +128,17 @@ export const obsidianGetNote = tool('obsidian_get_note', {
       .describe('Mode-discriminated projection of the requested note.'),
   }),
   enrichment: {
+    requestedPath: z
+      .string()
+      .optional()
+      .describe(
+        'The `target.path` as sent. Present only when it had no exact match and its single case-insensitive match in the same folder, `result.path`, was read instead — write and delete tools need `result.path`.',
+      ),
     notice: z
       .string()
       .optional()
       .describe(
-        'Guidance when a heading locator matched several headings — names the path that was read and points at `candidates` for the rest.',
+        'Guidance when the read substituted a case-insensitive path match (names both paths), when a heading locator matched several headings (names the path that was read and points at `candidates` for the rest), or both.',
       ),
   },
   auth: ['tool:obsidian_get_note:read'],
@@ -145,9 +154,9 @@ export const obsidianGetNote = tool('obsidian_get_note', {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'The target path is outside OBSIDIAN_READ_PATHS (and OBSIDIAN_WRITE_PATHS, since write paths imply read access).',
+      when: 'The target path is outside OBSIDIAN_READ_PATHS (and OBSIDIAN_WRITE_PATHS, since write paths imply read access), or inside OBSIDIAN_DENY_PATHS.',
       recovery:
-        'Use a path inside the configured read scope. The error data echoes the active scope.',
+        'Use a path inside the configured read scope. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'note_missing',
@@ -226,11 +235,16 @@ export const obsidianGetNote = tool('obsidian_get_note', {
 
     if (input.format === 'content') {
       if (target.type === 'path') {
-        const { result: content, resolvedPath } = await withCaseFallback(ctx, svc, target, (t) =>
+        const fallback = await withCaseFallback(ctx, svc, target, (t) =>
           svc.getNoteContent(ctx, t),
         );
+        discloseCaseSubstitution(ctx, fallback, 'read');
         return {
-          result: { format: 'content' as const, path: resolvedPath ?? target.path, content },
+          result: {
+            format: 'content' as const,
+            path: fallback.resolvedPath ?? target.path,
+            content: fallback.result,
+          },
         };
       }
       const note = await svc.getNoteJson(ctx, target);
@@ -238,9 +252,9 @@ export const obsidianGetNote = tool('obsidian_get_note', {
     }
 
     if (input.format === 'full') {
-      const { result: note } = await withCaseFallback(ctx, svc, target, (t) =>
-        svc.getNoteJson(ctx, t),
-      );
+      const fallback = await withCaseFallback(ctx, svc, target, (t) => svc.getNoteJson(ctx, t));
+      discloseCaseSubstitution(ctx, fallback, 'read');
+      const note = fallback.result;
       return {
         result: {
           format: 'full' as const,
@@ -256,27 +270,28 @@ export const obsidianGetNote = tool('obsidian_get_note', {
 
     if (input.format === 'document-map') {
       if (target.type === 'path') {
-        const { result: map, resolvedPath } = await withCaseFallback(ctx, svc, target, (t) =>
+        const fallback = await withCaseFallback(ctx, svc, target, (t) =>
           svc.getDocumentMap(ctx, t),
         );
+        discloseCaseSubstitution(ctx, fallback, 'read');
+        const map = fallback.result;
         return {
           result: {
             format: 'document-map' as const,
-            path: resolvedPath ?? target.path,
+            path: fallback.resolvedPath ?? target.path,
             headings: map.headings,
             blocks: map.blocks,
             frontmatterFields: map.frontmatterFields,
           },
         };
       }
-      const [map, path] = await Promise.all([
-        svc.getDocumentMap(ctx, target),
-        svc.resolvePath(ctx, target),
-      ]);
+      // Resolve once and read the map from that note, so `path` and the map always agree.
+      const pinned = await svc.resolveTarget(ctx, target);
+      const map = await svc.getDocumentMap(ctx, pinned);
       return {
         result: {
           format: 'document-map' as const,
-          path,
+          path: pinned.path,
           headings: map.headings,
           blocks: map.blocks,
           frontmatterFields: map.frontmatterFields,
@@ -287,12 +302,11 @@ export const obsidianGetNote = tool('obsidian_get_note', {
     if (!input.section) {
       throw ctx.fail('section_required', '`section` is required when `format` is "section".', {
         format: input.format,
-        ...ctx.recoveryFor('section_required'),
       });
     }
-    const { result: note } = await withCaseFallback(ctx, svc, target, (t) =>
-      svc.getNoteJson(ctx, t),
-    );
+    const fallback = await withCaseFallback(ctx, svc, target, (t) => svc.getNoteJson(ctx, t));
+    const caseNotice = discloseCaseSubstitution(ctx, fallback, 'read');
+    const note = fallback.result;
     // `extractSection` throws `NotFound` for missing heading/block/frontmatter
     // targets — those route through the contract; anything else bubbles up to
     // the framework's default classifier.
@@ -304,16 +318,15 @@ export const obsidianGetNote = tool('obsidian_get_note', {
       throw ctx.fail(
         'section_missing',
         err.message,
-        { path: note.path, section: input.section, ...ctx.recoveryFor('section_missing') },
+        { path: note.path, section: input.section },
         { cause: err },
       );
     }
     const { candidates, sectionTarget, value } = extracted;
     if (candidates) {
       const repeatedPath = candidates.every((c) => c === sectionTarget);
-      ctx.enrich.notice(
-        `Heading \`${input.section.target}\` is ambiguous — ${candidates.length} headings share that name; read \`${sectionTarget}\`. See \`candidates\` for the rest.${repeatedPath ? ' Every one has the same full path, so the write tools reject it with `ambiguous_section`.' : ''}`,
-      );
+      const headingNotice = `Heading ${inlineCode(input.section.target)} is ambiguous — ${candidates.length} headings share that name; read ${inlineCode(String(sectionTarget))}. See \`candidates\` for the rest.${repeatedPath ? ' Every one has the same full path, so the write tools reject it with `ambiguous_section`.' : ''}`;
+      ctx.enrich.notice(caseNotice ? `${caseNotice} ${headingNotice}` : headingNotice);
     }
     return {
       result: {
@@ -330,78 +343,108 @@ export const obsidianGetNote = tool('obsidian_get_note', {
   },
 
   format: ({ result }) => {
+    const header = `**${escapeMarkdownInline(result.path)}** (format: ${result.format})`;
     if (result.format === 'content') {
-      return [
-        {
-          type: 'text',
-          text: `**${result.path}** (format: ${result.format})\n\n${result.content}`,
-        },
-      ];
+      return [{ type: 'text', text: `${header}\n\n${result.content}` }];
     }
     if (result.format === 'full') {
       const lines = [
-        `**${result.path}** (format: ${result.format})`,
-        `*Tags:* ${result.tags.length > 0 ? result.tags.join(', ') : '(none)'}`,
+        header,
+        `*Tags:* ${result.tags.length > 0 ? result.tags.map(escapeMarkdownInline).join(', ') : '(none)'}`,
         `*Stat:* ctime=${result.stat.ctime} mtime=${result.stat.mtime} size=${result.stat.size}`,
       ];
       const fmKeys = Object.keys(result.frontmatter);
       if (fmKeys.length > 0) {
         lines.push('', '**Frontmatter**');
         for (const k of fmKeys) {
-          lines.push(`- \`${k}\`: ${stringifyValue(result.frontmatter[k])}`);
+          lines.push(`- ${inlineCode(k)}: ${inlineValue(result.frontmatter[k])}`);
         }
       }
       if (result.outgoingLinks && result.outgoingLinks.length > 0) {
         lines.push('', `**Outgoing links (${result.outgoingLinks.length})**`);
         for (const l of result.outgoingLinks) {
-          lines.push(`- [${l.type}] ${l.target}`);
+          lines.push(`- [${l.type}] ${escapeMarkdownInline(l.target)}`);
         }
       }
-      lines.push('', '**Content**', result.content);
+      // The blank line keeps the raw body's first line out of the label's block.
+      lines.push('', '**Content**', '', result.content);
       return [{ type: 'text', text: lines.join('\n') }];
     }
     if (result.format === 'document-map') {
       const lines = [
-        `**${result.path}** (format: ${result.format})`,
+        header,
         '',
         `**Headings (${result.headings.length})**`,
-        ...result.headings.map((h) => `- ${h}`),
+        ...result.headings.map((h) => `- ${escapeMarkdownInline(h)}`),
         '',
         `**Blocks (${result.blocks.length})**`,
-        ...result.blocks.map((b) => `- ^${b}`),
+        ...result.blocks.map((b) => `- ^${escapeMarkdownInline(b)}`),
         '',
         `**Frontmatter fields (${result.frontmatterFields.length})**`,
-        ...result.frontmatterFields.map((f) => `- ${f}`),
+        ...result.frontmatterFields.map((f) => `- ${escapeMarkdownInline(f)}`),
       ];
       return [{ type: 'text', text: lines.join('\n') }];
     }
-    // valueText: heading/block sections; valueJson: frontmatter sections.
+    // valueText: heading/block sections (note body, raw); valueJson: frontmatter sections.
     const value =
       result.valueText !== undefined
         ? result.valueText
         : result.valueJson !== undefined
-          ? stringifyValue(result.valueJson)
+          ? blockValue(result.valueJson)
           : '_(empty)_';
     const lines = [
-      `**${result.path}** (format: ${result.format})`,
-      `*Section:* ${result.section.type} → ${result.section.target}`,
+      header,
+      `*Section:* ${result.section.type} → ${escapeMarkdownInline(result.section.target)}`,
     ];
     if (result.sectionTarget !== undefined) {
-      lines.push(`*Resolved:* ${result.sectionTarget}`);
+      lines.push(`*Resolved:* ${escapeMarkdownInline(result.sectionTarget)}`);
     }
     if (result.candidates && result.candidates.length > 0) {
-      lines.push(`*Candidates:* ${result.candidates.join(', ')}`);
+      lines.push(`*Candidates:* ${result.candidates.map(escapeMarkdownInline).join(', ')}`);
     }
-    lines.push('', '**Value:**', value);
+    lines.push('', '**Value:**', '', value);
     return [{ type: 'text', text: lines.join('\n') }];
   },
 });
 
-function stringifyValue(v: unknown): string {
-  if (v === null || v === undefined) return '(empty)';
-  if (typeof v === 'string') return v;
-  return JSON.stringify(v, null, 2);
+/** A frontmatter section's value as its own block: a string as escaped text, anything else as fenced JSON. */
+function blockValue(v: unknown): string {
+  if (v === null) return '(empty)';
+  if (typeof v === 'string') return escapeMarkdownInline(v);
+  return markdown()
+    .codeBlock(JSON.stringify(v, null, 2), 'json')
+    .build();
 }
+
+/** A frontmatter value in a list item: a string as escaped text, anything else as its JSON in a code span. */
+function inlineValue(v: unknown): string {
+  if (v === null || v === undefined) return '(empty)';
+  if (typeof v === 'string') return escapeMarkdownInline(v);
+  return inlineCode(JSON.stringify(v));
+}
+
+/**
+ * The target of a wikilink body: the text before the first `|` (alias) or `#`
+ * (section). A backslash right before the alias pipe escapes it — Obsidian
+ * reads `[[Note\|A]]` as `Note` (the only way to alias inside a table cell) —
+ * while any other backslash stays: `[[Note\#H]]` and `[[Note\\|A]]` give `Note\`.
+ */
+function wikilinkTarget(body: string): string {
+  const end = body.search(/[|#]/);
+  if (end < 0) return body.trim();
+  const target = body.slice(0, end);
+  return (body[end] === '|' && target.endsWith('\\') ? target.slice(0, -1) : target).trim();
+}
+
+/**
+ * Markdown link: `[text](url)` or `[text](url "title")`. The URL is either
+ * `<bracketed text with spaces>` — the markdown spec's escape hatch for paths
+ * containing spaces — or a non-whitespace run whose parentheses come in
+ * balanced pairs (`Note(1).md`). The text may not contain `[` or `]`, and a
+ * bare URL ends at an unpaired `(`, so an unclosed `[` or `[a](` stops at the
+ * next bracket or parenthesis instead of scanning to the end of the note.
+ */
+const MARKDOWN_LINK = /\[[^[\]]*\]\((<[^<>\n]+>|(?:[^()\s]|\([^()\s]*\))+)(?:\s+"[^"]*")?\)/g;
 
 /**
  * Extract outgoing link references from note content. Captures Obsidian
@@ -409,6 +452,12 @@ function stringifyValue(v: unknown): string {
  * `#section`) and markdown links (`[text](target)`). External URIs
  * (any `scheme:` form) are filtered out — only vault-internal references
  * remain. No existence checks; this is the link graph as written.
+ *
+ * A wikilink's extent is `wikilinkCloser`'s, the rule `obsidian_manage_tags`
+ * protects links by; the `!` of an embed sits before the `[[` and changes
+ * neither. An opener with no closer is passed over one character at a time,
+ * since its second `[` may open a link (`[[[[Note]]` links `[Note`).
+ * {@link wikilinkTarget} takes the target out of the body.
  *
  * Fenced code blocks and inline code are blanked before matching so notes
  * documenting markdown syntax don't yield false-positive links.
@@ -419,17 +468,19 @@ function parseOutgoingLinks(
   const cleaned = stripMarkdownCode(content);
   const links: Array<{ target: string; type: 'wikilink' | 'markdown' }> = [];
 
-  for (const m of cleaned.matchAll(/!?\[\[([^\]|#]+)(?:[#|][^\]]*)?\]\]/g)) {
-    const target = m[1]?.trim();
+  const linkEnd = wikilinkCloser(cleaned);
+  for (let open = cleaned.indexOf('[['); open >= 0; ) {
+    const end = linkEnd(open);
+    if (end === undefined) {
+      open = cleaned.indexOf('[[', open + 1);
+      continue;
+    }
+    const target = wikilinkTarget(cleaned.slice(open + 2, end - 2));
     if (target) links.push({ target, type: 'wikilink' });
+    open = cleaned.indexOf('[[', end);
   }
 
-  /**
-   * URL group accepts either `<bracketed text with spaces>` or a non-whitespace
-   * run. The bracketed form is the markdown spec's escape hatch for paths
-   * containing spaces.
-   */
-  for (const m of cleaned.matchAll(/\[[^\]]*\]\((<[^<>\n]+>|[^)\s]+)(?:\s+"[^"]*")?\)/g)) {
+  for (const m of cleaned.matchAll(MARKDOWN_LINK)) {
     let target = m[1]?.trim();
     if (!target) continue;
     if (target.startsWith('<') && target.endsWith('>')) {
