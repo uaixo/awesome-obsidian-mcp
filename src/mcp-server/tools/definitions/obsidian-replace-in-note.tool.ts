@@ -8,8 +8,10 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { frontmatterParseError, splice } from '@/services/obsidian/frontmatter-ops.js';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { inlineCode } from './_shared/markdown.js';
 import { nameRegexSafetyIssue } from './_shared/regex-safety.js';
 import { TargetSchema } from './_shared/schemas.js';
 
@@ -110,9 +112,9 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'The target path is outside OBSIDIAN_WRITE_PATHS, or OBSIDIAN_READ_ONLY=true denies all writes. The pre-read also requires the path to be readable.',
+      when: 'The target path is outside OBSIDIAN_WRITE_PATHS or inside OBSIDIAN_DENY_PATHS, or OBSIDIAN_READ_ONLY=true denies all writes. The pre-read also requires the path to be readable.',
       recovery:
-        'Use a path inside the configured write scope. The error data echoes the active scope.',
+        'Use a path inside the configured write scope. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'regex_invalid',
@@ -196,6 +198,8 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
     const svc = getObsidianService();
     const { target } = input;
     const note = await svc.getNoteJson(ctx, target);
+    // The write goes to the note this read returned, never to a second resolution of `target`.
+    const pathTarget = svc.pinTarget(target, note.path);
     // Delivered bytes — not note.stat.size (see ObsidianService.tryGetSize).
     const previousSizeInBytes = Buffer.byteLength(note.content, 'utf8');
 
@@ -229,7 +233,6 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
         if (safetyIssue) {
           throw ctx.fail('regex_unsafe', `Unsafe regex '${r.search}': ${safetyIssue}`, {
             search: r.search,
-            ...ctx.recoveryFor('regex_unsafe'),
           });
         }
         let re: RegExp;
@@ -239,7 +242,7 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
           throw ctx.fail(
             'regex_invalid',
             `Invalid regex '${r.search}': ${(err as Error).message}`,
-            { search: r.search, ...ctx.recoveryFor('regex_invalid') },
+            { search: r.search },
             { cause: err },
           );
         }
@@ -308,15 +311,15 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
         throw ctx.fail(
           'frontmatter_invalid',
           `Replacements left the frontmatter of ${note.path} unparseable: ${problem}`,
-          { path: note.path, ...ctx.recoveryFor('frontmatter_invalid') },
+          { path: note.path },
         );
       }
     }
 
     let currentSizeInBytes = previousSizeInBytes;
     if (totalReplacements > 0) {
-      await svc.writeNote(ctx, target, fm.open + yamlText + fm.close + body, 'markdown');
-      currentSizeInBytes = await svc.getSize(ctx, { type: 'path', path: note.path });
+      await svc.writeNote(ctx, pathTarget, fm.open + yamlText + fm.close + body, 'markdown');
+      currentSizeInBytes = await svc.getSize(ctx, pathTarget);
     }
 
     return {
@@ -330,15 +333,19 @@ export const obsidianReplaceInNote = tool('obsidian_replace_in_note', {
 
   format: (result) => {
     const lines = [
-      `**Replaced in ${result.path}**`,
+      `**Replaced in ${escapeMarkdownInline(result.path)}**`,
       `*Total replacements:* ${result.totalReplacements}`,
       `*Size:* ${result.previousSizeInBytes} → ${result.currentSizeInBytes} bytes`,
       '',
       '**Per replacement**',
     ];
     for (const r of result.perReplacement) {
+      // A code span reads a line break back as a space; escaped text keeps it.
+      const search = /[\r\n]/.test(r.search)
+        ? escapeMarkdownInline(r.search)
+        : inlineCode(r.search);
       lines.push(
-        `- \`${r.search}\` → ${r.count} match${r.count === 1 ? '' : 'es'} (body ${r.bodyCount}, frontmatter ${r.frontmatterCount})`,
+        `- ${search} → ${r.count} match${r.count === 1 ? '' : 'es'} (body ${r.bodyCount}, frontmatter ${r.frontmatterCount})`,
       );
     }
     return [{ type: 'text', text: lines.join('\n') }];

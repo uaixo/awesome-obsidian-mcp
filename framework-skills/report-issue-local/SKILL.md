@@ -4,7 +4,7 @@ description: >
   File a bug or feature request against this MCP server's own repo. Use for server-specific issues — tool logic, service integrations, config problems, or domain bugs that aren't caused by the framework.
 metadata:
   author: cyanheads
-  version: "1.10"
+  version: "1.13"
   audience: external
   type: workflow
 ---
@@ -38,7 +38,8 @@ gh repo view --json nameWithOwner -q '.nameWithOwner'
 gh issue list --search "your error message or keyword" --state all
 
 # Assess a close match before commenting — is it already linked to a fix or referenced elsewhere?
-gh issue view <number> --comments
+gh issue view <number>              # body
+gh issue view <number> --comments   # thread only — without a TTY it prints no body
 gh api 'repos/{owner}/{repo}/issues/<number>/timeline' --paginate \
   --jq '.[] | select(.event=="cross-referenced") | .source.issue | "\(.repository.full_name)#\(.number) — \(.title)"'
 ```
@@ -77,7 +78,7 @@ gh issue create --template "Bug Report" --web
 
 ### CLI (non-interactive)
 
-Structure the `--body` to match the template's form fields. Description is two or three sentences; the reproduction is the exact input and the observed output, nothing else. Add `### Additional context` only when it changes the fix (a workaround, a related issue, the one log line that matters) — omitted by default.
+Structure the `--body` to match the template's form fields. `Environment` is the form's one-row table: the server version from `package.json`, the installed mcp-ts-core version from `node_modules/@cyanheads/mcp-ts-core/package.json` (not the `^` range), the runtime with its version (`bun --version`), the transport, and the OS. Description is two or three sentences; the reproduction is the exact input and the observed output, nothing else. Add `### Additional context` only when it changes the fix (a workaround, a related issue, the one log line that matters) — omitted by default.
 
 ````bash
 gh issue create \
@@ -85,25 +86,11 @@ gh issue create \
   --label "bug" \
   --assignee "@me" \
   --body "$(cat <<'ISSUE'
-### Server version
+### Environment
 
-0.1.0
-
-### mcp-ts-core version
-
-0.1.29
-
-### Runtime
-
-Bun
-
-### Runtime version
-
-Bun 1.3.x
-
-### Transport
-
-stdio
+| Server | mcp-ts-core | Runtime | Transport | OS |
+|---|---|---|---|---|
+| 0.4.2 | 0.13.16 | Bun 1.4.4 | stdio | macOS 15.x |
 
 ### Description
 
@@ -158,7 +145,7 @@ Every issue needs exactly one primary label. Stack secondary labels on top when 
 | `regression` | Worked before, broken after a change |
 | `performance` | Memory, CPU, latency, or resource usage |
 | `security` | Vulnerability, CVE, or hardening work |
-| `breaking-change` | Change will break public API; requires a major bump |
+| `breaking-change` | Change will break public API or an existing tool contract |
 | `blocked-by-framework` | Fix requires a released change in `@cyanheads/mcp-ts-core`; pairs with a `Depends on: cyanheads/mcp-ts-core#N` line in the body |
 | `blocked-by-sdk` | Fix requires changes in `@modelcontextprotocol/sdk` |
 | `surplus-token-idea` | Worth exploring when token budget allows |
@@ -173,7 +160,7 @@ Secondary labels are not GitHub defaults — if `gh issue create --label "regres
 gh label create regression --color e99695 --description "Worked before, broken after a change"
 gh label create performance --color 5319e7 --description "Memory, CPU, latency, or resource usage"
 gh label create security --color b60205 --description "Vulnerability, CVE, or hardening work"
-gh label create breaking-change --color d93f0b --description "Change will break public API; requires a major bump"
+gh label create breaking-change --color d93f0b --description "Change will break public API or an existing tool contract"
 gh label create blocked-by-framework --color fbca04 --description "Fix requires a released change in @cyanheads/mcp-ts-core"
 gh label create blocked-by-sdk --color c5def5 --description "Fix requires changes in @modelcontextprotocol/sdk"
 gh label create surplus-token-idea --color FF10F0 --description "Worth exploring when token budget allows"
@@ -207,7 +194,7 @@ gh issue create --template "Feature Request" --web
 
 ### CLI (non-interactive)
 
-The first three headings are the Feature Request form's own fields, in its order — `Use case` and `Proposed behavior` are required by the form, so a body without them does not satisfy it. `Out of scope` is one or two lines. Nothing else by default: a `Scope`, `Flow`, `Design / Tradeoffs`, or `Depends on` block is added only when the reader cannot act without it, and each stays to a few lines.
+Read `.github/ISSUE_TEMPLATE/feature_request.yml` and match its field labels and order. The default form requires `Use case` and `Proposed behavior`; `Alternatives considered` and `Additional context` are optional. Include an optional section only when it changes what the reader needs to do. Scope boundaries belong in `Additional context` when necessary, not in a mandatory extra heading.
 
 ````bash
 gh issue create \
@@ -233,9 +220,9 @@ What you want the server to do, then the new behavior or surface. For tool/resou
 
 What you tried or evaluated instead, and why it didn't fit.
 
-### Out of scope
+### Additional context
 
-- Adjacent work that belongs in a separate issue
+Only context needed to act, such as a relevant dependency or a scope boundary. Omit this section when it adds nothing.
 ISSUE
 )"
 ````
@@ -258,7 +245,8 @@ When genuinely ambiguous, file against this server's repo and note that it might
 ## Following Up
 
 ```bash
-# View issue details (with comment thread)
+# View the issue body, then its comment thread (--comments without a TTY prints no body)
+gh issue view <number>
 gh issue view <number> --comments
 
 # Add context
@@ -278,6 +266,6 @@ gh issue close <number> --reason completed --comment "Fixed in <commit or PR>"
 - [ ] All secrets, credentials, and tokens redacted
 - [ ] Title follows `type(scope): description` format
 - [ ] Primary label assigned (`bug` / `enhancement` / `documentation`)
-- [ ] If bug: version, runtime, repro steps, actual vs expected behavior included
-- [ ] If feature: `Use case` and `Proposed behavior` present (the form's required fields), `Alternatives considered` third; Out of scope defined
+- [ ] If bug: Environment table filled in, repro steps, actual vs expected behavior included
+- [ ] If feature: the repository form's required fields are present; optional sections follow its labels and order and add necessary context
 - [ ] Inside the budget — ~150 words for a bug, ~250 for a feature, code and logs excluded — and every section past the form's fields earns its place

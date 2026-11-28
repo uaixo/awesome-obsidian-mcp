@@ -16,6 +16,7 @@ import {
   isIntegerKey,
   patchFormatFor,
   relativeHeadingLevels,
+  v1HeadingBody,
   v1PatchHeaders,
   v2Instruction,
 } from '@/services/obsidian/patch-instruction.js';
@@ -25,7 +26,7 @@ import {
   sectionLevel,
 } from '@/services/obsidian/section-extractor.js';
 import type { PatchInstruction } from '@/services/obsidian/types.js';
-import { repeatKey } from '../helpers.js';
+import { expectLinearCost, repeatKey } from '../helpers.js';
 
 describe('patchFormatFor', () => {
   it.each([
@@ -90,13 +91,96 @@ describe('v1PatchHeaders', () => {
   });
 });
 
+describe('v1HeadingBody', () => {
+  const TIGHT = '# T\n## A\n- one\n- two\n## B\ntext\n';
+  const at = (target: string, extra: Partial<PatchInstruction> = {}) => write({ target, ...extra });
+
+  it.each([
+    ['append', '- x', '- x\n'],
+    ['prepend', '- x', '- x\n'],
+    ['replace', '- x', '- x\n'],
+    ['append', 'two lines\nhere', 'two lines\nhere\n'],
+  ] as const)('closes a %s of %j with one line break', (operation, content, body) => {
+    expect(v1HeadingBody(at('T::A', { operation }), content, TIGHT)).toBe(body);
+  });
+
+  it.each(['- x\n', '- x\r\n', '- x\n\n', '\n'])('adds no second line break to %j', (content) => {
+    expect(v1HeadingBody(at('T::A'), content, TIGHT)).toBe(content);
+  });
+
+  it.each(['append', 'prepend', 'replace'] as const)(
+    'keeps empty content empty on a %s',
+    (operation) => {
+      expect(v1HeadingBody(at('T::A', { operation }), '', TIGHT)).toBe('');
+      expect(v1HeadingBody(at('T::A', { operation }), '', '# T\n## A')).toBe('');
+    },
+  );
+
+  it.each([
+    [
+      'an append to a section ending a note with no final line break',
+      '# T\n## A\n- one',
+      'T::A',
+      {},
+    ],
+    [
+      'an append to a parent whose last child ends the unterminated note',
+      '# T\n## A\n- one',
+      'T',
+      {},
+    ],
+    ['an append with trimTargetWhitespace', TIGHT, 'T::A', { trimTargetWhitespace: true }],
+    ['a prepend under an unterminated last heading', '# T\n## A', 'T::A', { operation: 'prepend' }],
+    ['a replace under an unterminated last heading', '# T\n## A', 'T::A', { operation: 'replace' }],
+    [
+      'a prepend under a heading with trailing spaces',
+      '# T\n## A  \nx\n',
+      'T::A',
+      { operation: 'prepend' },
+    ],
+    [
+      'a prepend three levels down, below frontmatter',
+      '---\na: 1\n---\n# T\n## A\n### C',
+      'T::A::C',
+      { operation: 'prepend' },
+    ],
+  ] as const)('opens %s with a line break', (_l, note, target, extra) => {
+    expect(v1HeadingBody(at(target, extra), '- x', note)).toBe('\n- x\n');
+  });
+
+  it.each([
+    ['an append to a section closed by the next heading', TIGHT, 'T::A', {}],
+    ['an append to a section ending a terminated note', '# T\n## A\n- one\n', 'T::A', {}],
+    [
+      'a prepend with trimTargetWhitespace',
+      TIGHT,
+      'T::A',
+      { operation: 'prepend', trimTargetWhitespace: true },
+    ],
+    ['a prepend under a setext heading', 'T\n===\n\nA\n---\nx\n', 'T::A', { operation: 'prepend' }],
+    [
+      'a section the note lacks, created on its own line',
+      '# T\n## A',
+      'T::A::New',
+      { createTargetIfMissing: true },
+    ],
+  ] as const)('does not open %s with a line break', (_l, note, target, extra) => {
+    expect(v1HeadingBody(at(target, extra), '- x', note)).toBe('- x\n');
+  });
+
+  it('keeps an opening line break the content already has', () => {
+    expect(v1HeadingBody(at('T::A'), '\n- x', '# T\n## A\n- one')).toBe('\n- x\n');
+    expect(v1HeadingBody(at('T::A'), '\r\n- x', '# T\n## A\n- one')).toBe('\r\n- x\n');
+  });
+});
+
 describe('v2Instruction', () => {
   it('splits a heading path into its array target, untitled and nested segments kept', () => {
     expect(v2Instruction(write({ target: '::A::B::C' }), 'x').target).toEqual(['', 'A', 'B', 'C']);
   });
 
-  it('keeps a block or frontmatter target as a string', () => {
-    expect(v2Instruction(write({ targetType: 'block', target: 'a::b' }), 'x').target).toBe('a::b');
+  it.each(['block', 'frontmatter'] as const)('keeps a %s target as a string', (targetType) => {
+    expect(v2Instruction(write({ targetType, target: 'a::b' }), 'x').target).toBe('a::b');
   });
 
   it('parses a JSON frontmatter value and keeps a markdown one as text', () => {
@@ -109,10 +193,11 @@ describe('v2Instruction', () => {
     expect(v2Instruction(fm, '[1]').value).toBe('[1]');
   });
 
-  it('leaves a non-string JSON array for table rows as the caller wrote it', () => {
+  it('wraps an all-string array as one table row and leaves any other JSON array as written', () => {
     const rows = write({ targetType: 'block', target: 't', contentType: 'json' });
-    expect(v2Instruction(rows, '[["a","b"]]').value).toEqual([['a', 'b']]);
+    expect(v2Instruction(rows, '["a","b"]').value).toEqual([['a', 'b']]);
     expect(v2Instruction(rows, '[]').value).toEqual([[]]);
+    expect(v2Instruction(rows, '[["a","b"]]').value).toEqual([['a', 'b']]);
     expect(v2Instruction(rows, '[1,2]').value).toEqual([1, 2]);
   });
 
@@ -172,6 +257,61 @@ describe('canonicalContent', () => {
     ['only whitespace', ' \n\t\n', ''],
   ])('reduces %s as markdown-patch 2.0 reduces a plain write', (_l, content, expected) => {
     expect(canonicalContent(content)).toBe(expected);
+  });
+
+  /** The reduction as three regex replaces, the form markdown-patch 2.0.0 writes it in. */
+  const regexReduction = (content: string) =>
+    content
+      .replace(/\r\n?/g, '\n')
+      .replace(/^(?:[^\S\n]*\n)+/, '')
+      .replace(/\s+$/, '');
+
+  it.each([
+    ['empty content', '', ''],
+    [
+      'every whitespace code point ECMAScript names',
+      ' \t\n\v\f\r\u{a0}\u{1680}\u{2000}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}\u{feff}',
+      '',
+    ],
+    ['mixed CRLF, CR, and LF breaks', 'a\r\n\r\n \r\nb\r \r\n\n', 'a\n\n \nb'],
+    ['trailing no-break spaces', 'a\u{a0}\u{a0}', 'a'],
+    ['an interior no-break space', 'a\u{a0}b', 'a\u{a0}b'],
+    ['a trailing line separator', 'a\u{2028}', 'a'],
+    ['a leading line separator on a blank line', '\u{2028}\na', 'a'],
+    ['a trailing byte order mark', 'a\u{feff}', 'a'],
+    ['trailing whitespace after a non-BMP character', 'a\u{1F600} \n', 'a\u{1F600}'],
+    ['a trailing non-BMP character', 'a\u{1D7D8}', 'a\u{1D7D8}'],
+    ['a trailing next-line control, which is not whitespace', 'a\u{85}', 'a\u{85}'],
+    ['a trailing Mongolian vowel separator, which is not whitespace', 'a\u{180e}', 'a\u{180e}'],
+    ['a trailing zero-width space, which is not whitespace', 'a\u{200b}', 'a\u{200b}'],
+    ['a trailing lone surrogate', 'a\u{d800}', 'a\u{d800}'],
+  ])('reduces %s exactly as the regex reduction does', (_l, content, expected) => {
+    expect(regexReduction(content)).toBe(expected);
+    expect(canonicalContent(content)).toBe(expected);
+  });
+
+  it('trims the same trailing code units as `/\\s+$/`, every BMP code unit tried', () => {
+    const differ: string[] = [];
+    for (let unit = 0; unit <= 0xffff; unit++) {
+      const content = `a${String.fromCharCode(unit)}`;
+      if (canonicalContent(content) !== regexReduction(content)) differ.push(unit.toString(16));
+    }
+    expect(differ).toEqual([]);
+  });
+
+  /**
+   * Heading appends and prepends reduce caller-sized content, so the reduction
+   * is timed from 5k to 320k characters (`expectLinearCost`) on a whitespace
+   * run that does not end the content: one long line ending in a break, and a
+   * run with breaks throughout.
+   */
+  it.each([
+    ['one long line ending in a break', (n: number) => `a${' '.repeat(n)}b\n`],
+    ['breaks throughout', (n: number) => `a${' \n'.repeat(n / 2)}b`],
+  ])('reduces a whitespace run on %s in linear time', async (_l, build) => {
+    await expectLinearCost(build, (content) => {
+      expect(canonicalContent(content)).toBe(content.slice(0, content.lastIndexOf('b') + 1));
+    });
   });
 });
 
@@ -243,6 +383,30 @@ describe('sectionLevel', () => {
   it('has no level for a missing path the write will not create', () => {
     expect(sectionLevel(note, 'A::C::New', false)).toBeUndefined();
     expect(sectionLevel(note, 'Nowhere', false)).toBeUndefined();
+  });
+
+  it('counts from the first occurrence of a repeated ancestor', () => {
+    const repeated = '# A\n## B\n# A\n### B\n';
+    expect(sectionLevel(repeated, 'A::B::New', true)).toBe(3);
+    expect(sectionLevel(repeated, 'A::New', true)).toBe(2);
+  });
+
+  it('cuts a created path at its delimiters as they split it, a heading ending in `:` included', () => {
+    // `N:::x::New` splits as `N`, `:x`, `New`: its ancestors are `N` and `N:::x`, never `N:`.
+    expect(sectionLevel('# N:\n## x\n', 'N:::x::New', true)).toBe(3);
+    expect(sectionLevel('# N:\n', 'N:::New', true)).toBe(2);
+    expect(sectionLevel('# N\n', 'N:::New', true)).toBe(2);
+  });
+
+  /** The path a write creates is the caller's, and its segments are unbounded in number. */
+  it.each([
+    ['under an existing ancestor', 'A'],
+    ['with no existing ancestor', 'Q'],
+  ])('levels a created heading of many segments %s in linear time', async (_label, root) => {
+    await expectLinearCost(
+      (size) => `${root}${'::x'.repeat(size / 3)}`,
+      (path) => sectionLevel(note, path, true),
+    );
   });
 });
 

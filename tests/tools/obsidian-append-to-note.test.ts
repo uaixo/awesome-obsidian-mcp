@@ -11,8 +11,11 @@ import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testi
 import { describe, expect, it } from 'vitest';
 import { obsidianAppendToNote } from '@/mcp-server/tools/definitions/obsidian-append-to-note.tool.js';
 import {
+  type DispatchOpts,
+  type DynamicReply,
   documentMapV2,
   instructionOf,
+  markdownText,
   noteJson,
   repeatKey,
   servePluginVersion,
@@ -22,6 +25,10 @@ import {
 const harness = setupHarness();
 
 const cl = (n: number) => ({ headers: { 'content-length': String(n) } });
+
+/** Recorded request headers keep the casing the service sent; read them by lower-cased key. */
+const lowerKeys = (headers: Record<string, string>): Record<string, string> =>
+  Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]));
 
 describe('obsidian_append_to_note (whole file)', () => {
   it('reports created:true with both sizes when the note did not exist', async () => {
@@ -79,26 +86,119 @@ describe('obsidian_append_to_note (whole file)', () => {
     });
   });
 
-  it('surfaces upstream auto-newline injection in currentSizeInBytes (4 + 4 → 9)', async () => {
+  /** The case-variant listing runs only on a refused append; a catch-all records anything else. */
+  it.each([
+    ['a new path', 404],
+    ['an existing exact-case note', 200],
+  ])('sends HEAD, POST, HEAD and nothing else for %s', async (_label, headStatus) => {
     const pool = harness.current().pool;
-    /** Mirrors verified plugin v3.6.1 behavior: appending 4 bytes to a 4-byte
-     * file lacking a trailing newline yields 9 bytes (plugin injects \n).
-     * The agent sees `currentSize - previousSize - bodyLen = 1` and can
-     * decide whether the +1 is expected slack or warrants a reread. */
-    pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply(200, '', cl(4));
-    pool.intercept({ path: '/vault/Note.md', method: 'POST' }).reply(200, '');
-    pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply(200, '', cl(9));
+    const seen: string[] = [];
+    const record = (opts: DispatchOpts, statusCode: number): DynamicReply => {
+      seen.push(`${opts.method} ${opts.path}`);
+      return { statusCode, data: '', responseOptions: { headers: { 'content-length': '4' } } };
+    };
+    pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply((o) => record(o, headStatus));
+    pool.intercept({ path: '/vault/Note.md', method: 'POST' }).reply((o) => record(o, 200));
+    pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply((o) => record(o, 200));
+    pool.intercept({ path: () => true }).reply((o) => record(o, 500));
 
-    const out = await obsidianAppendToNote.handler(
+    await obsidianAppendToNote.handler(
       obsidianAppendToNote.input.parse({
         target: { type: 'path', path: 'Note.md' },
-        content: 'BBBB',
+        content: 'tail',
       }),
       createMockContext({ errors: obsidianAppendToNote.errors }),
     );
 
-    expect(out.previousSizeInBytes).toBe(4);
-    expect(out.currentSizeInBytes).toBe(9);
+    expect(seen).toEqual(['HEAD /vault/Note.md', 'POST /vault/Note.md', 'HEAD /vault/Note.md']);
+  });
+});
+
+/**
+ * `Notes/case.md` exists; the caller appends to `Notes/Case.md`. On a
+ * case-insensitive filesystem the HEAD answers 200 for the folded spelling and
+ * Obsidian's `Vault.create` refuses the whole-file POST with HTTP 500 "File
+ * already exists." (Local REST API 5.2.0). The real name comes from the
+ * parent listing.
+ */
+describe('obsidian_append_to_note (case variant on a case-insensitive filesystem)', () => {
+  const textOf = (res: Awaited<ReturnType<typeof runToolContract>>) =>
+    res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+  const errorOf = (res: Awaited<ReturnType<typeof runToolContract>>) =>
+    (res.structuredContent as { error: { code: number; data: Record<string, unknown> } }).error;
+  const contractRecovery = obsidianAppendToNote.errors?.find(
+    (e) => e.reason === 'case_variant_exists',
+  )?.recovery;
+
+  const input = { target: { type: 'path' as const, path: 'Notes/Case.md' }, content: 'y' };
+
+  /**
+   * HEAD 200, the refused POST, then the parent listing — its files, or a
+   * reply function for a listing that throws; returns the POST count.
+   */
+  function serve(listing: string[] | (() => never)): () => number {
+    const pool = harness.current().pool;
+    pool.intercept({ path: '/vault/Notes/Case.md', method: 'HEAD' }).reply(200, '', cl(7));
+    let posts = 0;
+    pool.intercept({ path: '/vault/Notes/Case.md', method: 'POST' }).reply(() => {
+      posts++;
+      return {
+        statusCode: 500,
+        data: { message: 'Internal Server Error\nFile already exists.', errorCode: 50000 },
+      };
+    });
+    const list = pool.intercept({ path: '/vault/Notes/', method: 'GET' });
+    if (Array.isArray(listing)) list.reply(200, { files: listing });
+    else list.reply(listing);
+    return () => posts;
+  }
+
+  it('names the existing note on both surfaces', async () => {
+    const posts = serve(['case.md', 'Other.md']);
+
+    const res = await runToolContract(obsidianAppendToNote, input);
+
+    expect(res.isError).toBe(true);
+    expect(posts()).toBe(1);
+    const error = errorOf(res);
+    expect(error.code).toBe(JsonRpcErrorCode.Conflict);
+    expect(error.data).toMatchObject({
+      reason: 'case_variant_exists',
+      path: 'Notes/Case.md',
+      existingPath: 'Notes/case.md',
+      recovery: { hint: contractRecovery },
+    });
+    const text = markdownText(textOf(res));
+    expect(text).toContain("Note 'Notes/case.md' already exists");
+    expect(text).toContain(contractRecovery);
+    expect(text).not.toContain('Internal Server Error');
+  });
+
+  it('omits existingPath when no listed file matches ignoring case', async () => {
+    const posts = serve(['Other.md']);
+
+    const res = await runToolContract(obsidianAppendToNote, input);
+
+    expect(posts()).toBe(1);
+    const { data } = errorOf(res);
+    expect(data).toMatchObject({ reason: 'case_variant_exists', path: 'Notes/Case.md' });
+    expect(Object.hasOwn(data, 'existingPath')).toBe(false);
+  });
+
+  it('propagates a cancellation during the folder listing', async () => {
+    const controller = new AbortController();
+    const cancelled = Object.assign(new Error('aborted'), { name: 'AbortError' });
+    serve(() => {
+      controller.abort();
+      throw cancelled;
+    });
+
+    const call = obsidianAppendToNote.handler(
+      obsidianAppendToNote.input.parse(input),
+      createMockContext({ signal: controller.signal, errors: obsidianAppendToNote.errors }),
+    );
+
+    await expect(call).rejects.toBe(cancelled);
   });
 });
 
@@ -163,7 +263,7 @@ describe('obsidian_append_to_note (section)', () => {
     let seenHeaders: Record<string, string> = {};
     let seenBody = '';
     pool.intercept({ path: '/vault/Note.md', method: 'PATCH' }).reply((opts) => {
-      seenHeaders = (opts.headers as Record<string, string>) ?? {};
+      seenHeaders = lowerKeys(opts.headers);
       seenBody = opts.body ?? '';
       return { statusCode: 200, data: '' };
     });
@@ -179,11 +279,10 @@ describe('obsidian_append_to_note (section)', () => {
       createMockContext({ errors: obsidianAppendToNote.errors }),
     );
 
-    expect(seenHeaders.operation ?? seenHeaders.Operation).toBe('append');
-    expect(seenHeaders['create-target-if-missing'] ?? seenHeaders['Create-Target-If-Missing']).toBe(
-      'true',
-    );
-    expect(seenBody).toBe('- new task');
+    expect(seenHeaders.operation).toBe('append');
+    expect(seenHeaders['create-target-if-missing']).toBe('true');
+    expect(seenHeaders['reject-if-content-preexists']).toBe('true');
+    expect(seenBody).toBe('- new task\n');
     expect(out).toEqual({
       path: 'Note.md',
       sectionTargeted: true,
@@ -306,6 +405,41 @@ describe('obsidian_append_to_note (section)', () => {
     });
   });
 
+  it('refuses a section append below a repeated link definition, on both surfaces, before any PATCH', async () => {
+    const pool = harness.current().pool;
+    pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply(200, '', cl(60));
+    servePluginVersion(pool, '5.2.0');
+    pool
+      .intercept({ path: '/vault/Note.md', method: 'GET' })
+      .reply(200, documentMapV2({ Daily: {}, Next: {} }));
+    pool
+      .intercept({ path: '/vault/Note.md', method: 'GET' })
+      .reply(200, noteJson('Note.md', '- [ref_1]: /a\n\n[REF_1]: /b\n\n# Daily\n- a\n# Next\n'));
+    // No PATCH intercept — a write here would surface "No mock intercept".
+
+    const res = await runToolContract(obsidianAppendToNote, {
+      target: { type: 'path', path: 'Note.md' },
+      section: { type: 'heading', target: 'Daily' },
+      content: '- b',
+    });
+
+    expect(res.isError).toBe(true);
+    const { error } = res.structuredContent as {
+      error: { code: number; data: Record<string, unknown> };
+    };
+    expect(error.code).toBe(JsonRpcErrorCode.Conflict);
+    expect(error.data).toMatchObject({
+      reason: 'repeated_link_definition',
+      path: 'Note.md',
+      label: 'REF_1',
+      line: 3,
+      recovery: { hint: expect.stringContaining('obsidian_replace_in_note') },
+    });
+    const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    expect(text).toContain('defines the link label `[REF_1]` a second time');
+    expect(text).toContain('reason repeated_link_definition');
+  });
+
   it('rejects a heading that would leave the section as heading_outside_section on both surfaces (plugin v5.x)', async () => {
     const pool = harness.current().pool;
     pool.intercept({ path: '/vault/Note.md', method: 'HEAD' }).reply(200, '', cl(200));
@@ -388,7 +522,7 @@ describe('obsidian_append_to_note / format()', () => {
     expect(text).toMatch(/Created:\*?\s*false/);
   });
 
-  it('renders the resolved section target alongside sectionTargeted', () => {
+  it('renders the section branch with the resolved section target and real sizes', () => {
     const blocks = obsidianAppendToNote.format!({
       path: 'Daily.md',
       sectionTargeted: true,
@@ -397,22 +531,13 @@ describe('obsidian_append_to_note / format()', () => {
       previousSizeInBytes: 200,
       currentSizeInBytes: 218,
     });
-    expect((blocks[0] as { text: string }).text).toContain(
-      'Section targeted:* true → Sandbox::Section A',
+    expect((blocks[0] as { text: string }).text).toBe(
+      [
+        '**Appended to Daily.md**',
+        '*Size:* 200 → 218 bytes',
+        '*Created:* false',
+        '*Section targeted:* true → Sandbox::Section A',
+      ].join('\n'),
     );
-  });
-
-  it('renders the section branch with sectionTargeted:true and real sizes', () => {
-    const blocks = obsidianAppendToNote.format!({
-      path: 'Daily.md',
-      sectionTargeted: true,
-      created: false,
-      previousSizeInBytes: 200,
-      currentSizeInBytes: 218,
-    });
-    const text = (blocks[0] as { text: string }).text;
-    expect(text).toContain('**Appended to Daily.md**');
-    expect(text).toMatch(/Size:\*?\s*200 → 218 bytes/);
-    expect(text).toMatch(/Section targeted:\*?\s*true/);
   });
 });

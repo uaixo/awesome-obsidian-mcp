@@ -9,12 +9,14 @@
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
 import { ContentTypeSchema, SectionSchema, TargetSchema } from './_shared/schemas.js';
+import { withCaseVariantNamed } from './_shared/suggest-paths.js';
 
 export const obsidianAppendToNote = tool('obsidian_append_to_note', {
   description:
-    'Append content to a note. **Without `section`: appends to the end of the file, or creates the file if it does not exist (your content becomes the full file).** With `section`: appends to the end of that heading/block/frontmatter (on Local REST API v5.0 and later, content appended to a heading is separated from the section’s existing content by a blank line, except a list item appended to a section that ends in a list and has no sub-headings, which continues that list) — use `obsidian_get_note` with `format: "document-map"` to discover available targets. Name a heading by its full `Parent::Child` path as the document map lists it, or by a bare leaf name matched at any depth. A leaf shared by several headings is rejected with `ambiguous_section`, unless one of them has no parent heading, in which case the write targets that one; a full path that occurs more than once in the note is rejected with `ambiguous_section` too. For block-reference targets, content is concatenated adjacent to the block line without inserting a separator — include a leading newline in `content` if you want one. Set `createTargetIfMissing` to bring the target section into existence rather than failing when it does not exist.',
+    'Append content to a note. **Without `section`: appends to the end of the file, or creates the file if it does not exist (your content becomes the full file).** When an existing file does not end in a line break, one is inserted before your content. On a case-insensitive filesystem, a path that differs from an existing note only in letter case fails with `case_variant_exists` (`existingPath` names the note when the folder listing shows exactly one case match). With `section`: appends to the end of that heading/block/frontmatter (on Local REST API v5.0 and later, content appended to a heading is separated from the section’s existing content by a blank line, except a list item appended to a section that ends in a list and has no sub-headings, which continues that list) — use `obsidian_get_note` with `format: "document-map"` to discover available targets. Name a heading by its full `Parent::Child` path as the document map lists it, or by a bare leaf name matched at any depth. A leaf shared by several headings is rejected with `ambiguous_section`, unless one of them has no parent heading, in which case the write targets that one; a full path that occurs more than once in the note is rejected with `ambiguous_section` too. A heading append is rejected with `repeated_link_definition` when a link reference definition that repeats an earlier label sits above where its section ends (for the last section, above its heading), which makes the plugin misplace the headings below it. For block-reference targets, content is concatenated adjacent to the block line without inserting a separator — include a leading newline in `content` if you want one. Set `createTargetIfMissing` to bring the target section into existence rather than failing when it does not exist.',
   annotations: { destructiveHint: true },
   input: z.object({
     target: TargetSchema.describe('Where the note lives.'),
@@ -60,12 +62,20 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
   auth: ['tool:obsidian_append_to_note:write'],
   errors: [
     {
+      reason: 'case_variant_exists',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Conflict,
+      when: 'Whole-file append to a path that differs from an existing note only in letter case, on a case-insensitive filesystem (macOS, Windows) where both name one file. `existingPath` names that note when the parent folder listing shows exactly one case match; it is omitted when several match, and when a file Obsidian does not index, such as a dot-file, already sits at the path.',
+      recovery:
+        'Retry with the path in `existingPath` on the error data, which names the same file. Without `existingPath`, list the folder with obsidian_list_notes and use the spelling it shows, or choose another path.',
+    },
+    {
       reason: 'path_forbidden',
       thrownBy: 'service',
       code: JsonRpcErrorCode.Forbidden,
-      when: 'The target path is outside OBSIDIAN_WRITE_PATHS, or OBSIDIAN_READ_ONLY=true denies all writes.',
+      when: 'The target path is outside OBSIDIAN_WRITE_PATHS or inside OBSIDIAN_DENY_PATHS, or OBSIDIAN_READ_ONLY=true denies all writes.',
       recovery:
-        'Use a path inside the configured write scope. The error data echoes the active scope.',
+        'Use a path inside the configured write scope. The error data echoes the active scope; a `denied_path` denial carries none, since the operator withholds that path.',
     },
     {
       reason: 'note_missing',
@@ -139,6 +149,14 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
         'Append the heading at the parent section or at the end of the note (no `section`), or write it one level below the target section or deeper.',
     },
     {
+      reason: 'repeated_link_definition',
+      thrownBy: 'service',
+      code: JsonRpcErrorCode.Conflict,
+      when: 'A link reference definition that repeats a label defined earlier in the note sits above where the target heading’s section ends (for the last section, above its heading); the Local REST API’s markdown parser drops it and misplaces every heading below it, so the append would land outside the section.',
+      recovery:
+        'Use obsidian_replace_in_note to place the content directly, or to remove or rename the repeated definition at `line`, then retry the section append.',
+    },
+    {
       reason: 'patch_rejected',
       thrownBy: 'service',
       code: JsonRpcErrorCode.ValidationError,
@@ -172,8 +190,8 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
      * presence probe and the write itself act on the same concrete file —
      * avoids re-resolving `active` / `periodic` targets across calls.
      */
-    const path = await svc.resolvePath(ctx, input.target);
-    const pathTarget = { type: 'path' as const, path };
+    const pathTarget = await svc.resolveTarget(ctx, input.target);
+    const { path } = pathTarget;
 
     if (input.section) {
       const previousSizeInBytes = await svc.getSize(ctx, pathTarget);
@@ -196,7 +214,9 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
     }
 
     const previousSizeInBytes = await svc.tryGetSize(ctx, pathTarget);
-    await svc.appendToNote(ctx, pathTarget, input.content, input.contentType);
+    await withCaseVariantNamed(ctx, svc, path, () =>
+      svc.appendToNote(ctx, pathTarget, input.content, input.contentType),
+    );
     const currentSizeInBytes = await svc.getSize(ctx, pathTarget);
     return {
       path,
@@ -209,7 +229,7 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
 
   format: (result) => {
     const action = result.created ? 'Created' : 'Appended to';
-    const lines = [`**${action} ${result.path}**`];
+    const lines = [`**${action} ${escapeMarkdownInline(result.path)}**`];
     if (result.created) {
       lines.push(
         '*Note:* this file did not exist before — your content is now the entire file. If you expected to add to existing content, double-check the path.',
@@ -218,7 +238,7 @@ export const obsidianAppendToNote = tool('obsidian_append_to_note', {
     lines.push(`*Size:* ${result.previousSizeInBytes} → ${result.currentSizeInBytes} bytes`);
     lines.push(`*Created:* ${result.created}`);
     lines.push(
-      `*Section targeted:* ${result.sectionTargeted}${result.sectionTarget ? ` → ${result.sectionTarget}` : ''}`,
+      `*Section targeted:* ${result.sectionTargeted}${result.sectionTarget ? ` → ${escapeMarkdownInline(result.sectionTarget)}` : ''}`,
     );
     return [{ type: 'text', text: lines.join('\n') }];
   },

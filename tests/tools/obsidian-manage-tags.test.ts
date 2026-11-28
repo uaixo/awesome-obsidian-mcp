@@ -3,11 +3,18 @@
  * @module tests/tools/obsidian-manage-tags.test
  */
 
+import type { z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import { obsidianManageTags } from '@/mcp-server/tools/definitions/obsidian-manage-tags.tool.js';
-import { setupHarness } from '../helpers.js';
+import type { NoteTarget } from '@/services/obsidian/types.js';
+import {
+  installMovingTargetVault,
+  MOVING_TARGET_NOTES,
+  markdownText,
+  setupHarness,
+} from '../helpers.js';
 
 const harness = setupHarness();
 
@@ -52,18 +59,21 @@ describe('obsidian_manage_tags / list', () => {
     if (out.result.operation !== 'list') throw new Error('expected list branch');
     expect(out.result.tags.frontmatter).toEqual(['foo', 'baz']);
     expect(out.result.tags.inline).toEqual(['foo', 'bar']);
-    expect(out.result.tags.all.sort()).toEqual(['bar', 'baz', 'foo']);
+    // Frontmatter order first, then inline tags not already seen.
+    expect(out.result.tags.all).toEqual(['foo', 'baz', 'bar']);
   });
 });
 
 describe('obsidian_manage_tags / add', () => {
   it('writes back when applied is non-empty and reports the post-state tag set', async () => {
+    const before = ['---', 'tags:', '  - existing', '---', 'Body without inline tags.'].join('\n');
+    const after = ['---', 'tags:', '  - existing', '  - fresh', '---', 'body'].join('\n');
     let putCalls = 0;
     let putBody = '';
     harness
       .current()
       .pool.intercept({ path: '/vault/N.md', method: 'GET' })
-      .reply(200, noteJson('Body without inline tags.', { tags: ['existing'] }, ['existing']), {
+      .reply(200, noteJson(before, { tags: ['existing'] }, ['existing']), {
         headers: { 'content-type': 'application/json' },
       });
     harness
@@ -77,11 +87,9 @@ describe('obsidian_manage_tags / add', () => {
     harness
       .current()
       .pool.intercept({ path: '/vault/N.md', method: 'GET' })
-      .reply(
-        200,
-        noteJson(putBody || 'body', { tags: ['existing', 'fresh'] }, ['existing', 'fresh']),
-        { headers: { 'content-type': 'application/json' } },
-      );
+      .reply(200, noteJson(after, { tags: ['existing', 'fresh'] }, ['existing', 'fresh']), {
+        headers: { 'content-type': 'application/json' },
+      });
 
     const out = await obsidianManageTags.handler(
       obsidianManageTags.input.parse({
@@ -94,15 +102,22 @@ describe('obsidian_manage_tags / add', () => {
     );
 
     expect(putCalls).toBe(1);
-    if (out.result.operation !== 'add') throw new Error('expected add branch');
-    expect(out.result.applied).toEqual(['fresh']);
-    expect(out.result.tags).toEqual(['existing', 'fresh']);
-    expect(out.result.previousSizeInBytes).toBe(
-      Buffer.byteLength('Body without inline tags.', 'utf8'),
+    expect(putBody).toBe(
+      ['---', 'tags:', '  - existing', '  - fresh', '---', 'Body without inline tags.'].join('\n'),
     );
-    /** Post-write GET already happens for the tag list echo — currentSize derives
-     * from Buffer.byteLength of that upstream-returned body (mock returns 'body'). */
-    expect(out.result.currentSizeInBytes).toBe(4);
+    /**
+     * `tags` and `currentSizeInBytes` come from the post-write GET, whose body
+     * deliberately differs from what was written.
+     */
+    expect(out.result).toEqual({
+      operation: 'add',
+      path: 'N.md',
+      applied: ['fresh'],
+      skipped: [],
+      tags: ['existing', 'fresh'],
+      previousSizeInBytes: Buffer.byteLength(before, 'utf8'),
+      currentSizeInBytes: Buffer.byteLength(after, 'utf8'),
+    });
   });
 
   it('skips both the write and the post-fetch when no tag changed', async () => {
@@ -147,7 +162,10 @@ describe('obsidian_manage_tags / add', () => {
 });
 
 describe('obsidian_manage_tags / remove', () => {
-  it('throws tags_required (ValidationError) when tags is empty/missing', async () => {
+  it.each([
+    ['omitted', undefined],
+    ['empty', []],
+  ])('throws tags_required (ValidationError) when tags is %s', async (_label, tags) => {
     harness
       .current()
       .pool.intercept({ path: '/vault/N.md', method: 'GET' })
@@ -160,6 +178,7 @@ describe('obsidian_manage_tags / remove', () => {
         obsidianManageTags.input.parse({
           target: { type: 'path', path: 'N.md' },
           operation: 'remove',
+          tags,
         }),
         createMockContext({ errors: obsidianManageTags.errors }),
       ),
@@ -219,21 +238,15 @@ describe('obsidian_manage_tags / a mixed-type tags sequence keeps its non-string
   }
 
   it('appends without rewriting the entries it does not recognize', async () => {
-    const putBody = await run('add', ['added']);
-
-    expect(putBody).toContain('- 42');
-    expect(putBody).toContain('{ meta: preserved }');
-    expect(putBody).toContain('- added');
-    expect(putBody).toContain('# a trailing comment');
-    expect(putBody).toContain('other: yes');
+    expect(await run('add', ['added'])).toBe(
+      MIXED.replace('  - { meta: preserved }', '  - { meta: preserved }\n  - added'),
+    );
   });
 
   it('removes only the matching string item', async () => {
-    const putBody = await run('remove', ['keep']);
-
-    expect(putBody).not.toContain('- keep');
-    expect(putBody).toContain('- 42');
-    expect(putBody).toContain('{ meta: preserved }');
+    expect(await run('remove', ['keep'])).toBe(
+      MIXED.replace('  - keep # a trailing comment\n', ''),
+    );
   });
 });
 
@@ -333,11 +346,17 @@ describe('obsidian_manage_tags / refuses an unsafe frontmatter block', () => {
     });
 
     expect(res.isError).toBe(true);
-    const error = (res.structuredContent as { error: { code: number; data: { reason: string } } })
-      .error;
+    const error = (
+      res.structuredContent as {
+        error: { code: number; message: string; data: { reason: string } };
+      }
+    ).error;
     expect(error.code).toBe(JsonRpcErrorCode.ValidationError);
     expect(error.data.reason).toBe('frontmatter_invalid');
-    const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    const text = markdownText(
+      res.content.map((b) => (b as { text?: string }).text ?? '').join('\n'),
+    );
+    expect(text).toContain(error.message);
     expect(text).toContain('not safely editable');
     expect(text).toContain(declaredRecovery('frontmatter_invalid'));
     expect(puts).toBe(0);
@@ -417,8 +436,15 @@ describe('obsidian_manage_tags / remove inline — byte fidelity through the han
     const text = render(out)
       .map((c) => (c.type === 'text' ? c.text : ''))
       .join('\n');
-    expect(text).toContain('wip');
-    expect(text).toContain('N.md');
+    expect(text).toBe(
+      [
+        '**Removed tags from N.md** (operation: remove)',
+        `*Size:* ${Buffer.byteLength(RICH, 'utf8')} → ${Buffer.byteLength(EXPECTED, 'utf8')} bytes`,
+        '*Applied (1):* `#wip`',
+        '*Skipped (0):* _(none)_',
+        '*All tags now (1):* `#keepme`',
+      ].join('\n'),
+    );
   });
 
   it('does not treat a #tag inside a frontmatter scalar as an inline tag', async () => {
@@ -544,6 +570,83 @@ describe('obsidian_manage_tags / link spans are not inline tags', () => {
     expect(putBody).toBe(after);
     if (out.result.operation !== 'remove') throw new Error('expected remove branch');
     expect(out.result.applied).toEqual(['work']);
+  });
+});
+
+/**
+ * A wikilink runs from `[[` to the first `]]` on its line, single brackets
+ * included, so a `#` in an alias or heading holding `[` or `]` is link text,
+ * while a tag after the link's `]]` is still read. Issue #160.
+ */
+describe('obsidian_manage_tags / a wikilink holding single brackets', () => {
+  const BODY = [
+    'x [[Note|a #b [1]]] and ![[Note#Sec [x]|A #c]] y',
+    'z [[Note|a ]#d]]] #e',
+    '',
+  ].join('\n');
+
+  const AFTER_ADD = `${BODY}#b #c #d\n`;
+
+  /**
+   * Serve `BODY`, record every PUT body, and serve `AFTER_ADD` on a read-back;
+   * run `input` on `N.md` and hand back both surfaces.
+   */
+  async function run(input: Omit<z.input<typeof obsidianManageTags.input>, 'target'>) {
+    const pool = harness.current().pool;
+    const json = { headers: { 'content-type': 'application/json' } };
+    pool
+      .intercept({ path: '/vault/N.md', method: 'GET' })
+      .reply(200, noteJson(BODY, {}, ['e']), json);
+    const puts: string[] = [];
+    pool.intercept({ path: '/vault/N.md', method: 'PUT' }).reply((opts) => {
+      puts.push(String(opts.body ?? ''));
+      return { statusCode: 200, data: '' };
+    });
+    pool
+      .intercept({ path: '/vault/N.md', method: 'GET' })
+      .reply(200, noteJson(AFTER_ADD, {}, ['e', 'b', 'c', 'd']), json);
+
+    const res = await runToolContract(obsidianManageTags, {
+      target: { type: 'path', path: 'N.md' },
+      ...input,
+    });
+    expect(res.isError).toBeFalsy();
+    const { result } = obsidianManageTags.output.parse(res.structuredContent);
+    const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+    return { puts, result, text };
+  }
+
+  it('lists only the tag after the link, on both surfaces', async () => {
+    const { result, text } = await run({ operation: 'list' });
+    if (result.operation !== 'list') throw new Error('expected list branch');
+    expect(result.tags.inline).toEqual(['e']);
+    expect(text).toContain('*Inline (1):* `#e`');
+  });
+
+  it('skips the link texts on remove and issues no write', async () => {
+    const { puts, result, text } = await run({
+      operation: 'remove',
+      location: 'inline',
+      tags: ['b', 'c', 'd'],
+    });
+    expect(puts).toEqual([]);
+    if (result.operation !== 'remove') throw new Error('expected remove branch');
+    expect(result.applied).toEqual([]);
+    expect(result.skipped).toEqual(['b', 'c', 'd']);
+    expect(text).toContain('*Skipped (3):* `#b` `#c` `#d`');
+  });
+
+  it('applies an inline add of the tags found only in link text', async () => {
+    const { puts, result, text } = await run({
+      operation: 'add',
+      location: 'inline',
+      tags: ['b', 'c', 'd'],
+    });
+    expect(puts).toEqual([AFTER_ADD]);
+    if (result.operation !== 'add') throw new Error('expected add branch');
+    expect(result.applied).toEqual(['b', 'c', 'd']);
+    expect(result.skipped).toEqual([]);
+    expect(text).toContain('*Applied (3):* `#b` `#c` `#d`');
   });
 });
 
@@ -775,5 +878,44 @@ describe('obsidian_manage_tags / tags Obsidian hides in blocks and reads in mark
     expect(result.tags).toEqual(['tm']);
     const text = res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
     expect(text).toContain('*Applied (5):* `#tv` `#tf` `#uc` `#tl` `#uo`');
+  });
+});
+
+/**
+ * An `active` or `periodic` target is resolved by the read; the write and the
+ * read-back after it address the note that read returned even when the target
+ * has moved to another note since.
+ */
+describe('obsidian_manage_tags writes to the note its read resolved', () => {
+  it.each<[string, NoteTarget, string, Parameters<typeof installMovingTargetVault>[0]]>([
+    ['active, no path policy', { type: 'active' }, '/active/', {}],
+    ['active, OBSIDIAN_READ_PATHS', { type: 'active' }, '/active/', { readPaths: ['work'] }],
+    ['daily, no path policy', { type: 'periodic', period: 'daily' }, '/periodic/daily/', {}],
+    [
+      'weekly for 2026-10-01, OBSIDIAN_READ_PATHS',
+      { type: 'periodic', period: 'weekly', date: '2026-10-01' },
+      '/periodic/weekly/2026/10/01/',
+      { readPaths: ['work'] },
+    ],
+  ])('%s', async (_label, target, route, config) => {
+    const { first, second, body } = MOVING_TARGET_NOTES;
+    const vault = installMovingTargetVault(config);
+
+    const res = await runToolContract(obsidianManageTags, {
+      target,
+      operation: 'add',
+      tags: ['moved'],
+    });
+
+    expect(res.isError).toBeFalsy();
+    expect(obsidianManageTags.output.parse(res.structuredContent).result.path).toBe(first);
+    expect(vault.requests.filter((r) => !r.startsWith('GET /'))).toEqual([`PUT /vault/${first}`]);
+    // The target route is resolved once; every other request names the pinned path.
+    expect(vault.requests.filter((r) => r !== 'GET /' && !r.includes(' /vault/'))).toEqual([
+      `GET ${route}`,
+    ]);
+    expect(vault.requests.at(-1)).toBe(`GET /vault/${first}`);
+    expect(vault.notes[first]).toContain('moved');
+    expect(vault.notes[second]).toBe(body(second));
   });
 });

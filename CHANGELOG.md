@@ -2,6 +2,30 @@
 
 All notable changes to this project. Each entry links to its full per-version file in [changelog/](changelog/).
 
+## [3.9.0](changelog/3.9.x/3.9.0.md) — 2026-11-11 · ⚠️ Breaking · 🛡️ Security
+
+Request timeouts are enforced on Bun and Node, Omnisearch is withheld under a read scope, and heading writes below a repeated link definition are refused before any PATCH. Scoped text searches evaluate once per walk, and the server publishes its first skill, obsidian-guide.
+
+## [3.8.0](changelog/3.8.x/3.8.0.md) — 2026-10-30 · ⚠️ Breaking · 🛡️ Security
+
+OBSIDIAN_DENY_PATHS withholds paths from reads and writes. Under a read scope, text and JSONLogic searches now read only readable notes, so out-of-scope notes no longer change their errors or results; a scoped JSONLogic tree naming link fields by a fixed var, missing, or missing_some key is rejected. Fixes the .mcpb bundle failing to boot.
+
+## [3.7.2](changelog/3.7.x/3.7.2.md) — 2026-10-25
+
+Vault text in content[] (paths, tags, headings, frontmatter keys and values, command names, search terms) reads back as written under a CommonMark parse. Adopts mcp-ts-core ^0.13.18, which escapes error text and renders enrichment trailer strings as code spans.
+
+## [3.7.1](changelog/3.7.x/3.7.1.md) — 2026-10-24 · 🛡️ Security
+
+Read-scope fixes: under OBSIDIAN_READ_PATHS, JSONLogic search runs in the server over readable notes only, active and periodic denials name the target rather than the resolved note, read-then-write tools write to the note they read, and instructions state the effective scope. A case-variant write fails as case_variant_exists.
+
+## [3.7.0](changelog/3.7.x/3.7.0.md) — 2026-10-05 · 🛡️ Security
+
+obsidian_delete_note now deletes on the first call unless OBSIDIAN_DELETE_ELICITATION=true, and obsidian_list_tags and obsidian_list_notes no longer expose tag names or folder and note names outside OBSIDIAN_READ_PATHS.
+
+## [3.6.1](changelog/3.6.x/3.6.1.md) — 2026-10-05 · ⚠️ Breaking · 🛡️ Security
+
+obsidian_delete_note now deletes only on a round that redeems a server-stored consent record, HTTP startup requires a stateful session, and the server moves to mcp-ts-core 0.13.12, whose tool errors carry a request ID and whose argument hints lead with the field path.
+
 ## [3.6.0](changelog/3.6.x/3.6.0.md) — 2026-09-23
 
 obsidian_patch_note, obsidian_append_to_note, obsidian_write_note, and the document map now speak markdown-patch 2.0 on Local REST API v5.x, required before plugin v6.0 removes the 1.x format they used to pin.

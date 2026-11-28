@@ -15,18 +15,20 @@ import { parseEnvConfig } from '@cyanheads/mcp-ts-core/config';
 const envBoolean = z.union([z.boolean(), z.stringbool()]);
 
 /**
- * Comma-separated path-list preprocessor. Semantics (see issue #40):
- * - undefined / `''` / whitespace-only → undefined (treat as unset; default = full vault)
+ * Comma-separated path-list preprocessor, shared by OBSIDIAN_READ_PATHS,
+ * OBSIDIAN_WRITE_PATHS, and OBSIDIAN_DENY_PATHS. Semantics (see issues #40, #76):
+ * - undefined / `''` / whitespace-only → undefined (treat as unset)
  * - `,` / `,,,` (separators only, no path content) → throw ZodError → ConfigurationError
  * - mixed empties (`a,,b`) → drop empties → `['a', 'b']`
- * - absolute path / `..` traversal → throw
- * - valid: `\` → `/` + lower-case + trim trailing slash + dedupe (preserves first occurrence order)
+ * - absolute path / `..` traversal / an entry naming the vault root (`.`, `./`) → throw
+ * - valid: `\` → `/`, empty and `.` segments dropped, lower-case, NFC, dedupe
+ *   (preserves first occurrence order)
  *
- * Separator normalization is required for parity with `PathPolicy.normalize()`,
- * which also collapses `\` → `/` on candidate paths. Without matching
- * normalization here, a prefix like `Foo\Bar` would never match a candidate
- * `Foo\Bar\note.md` (candidate becomes `foo/bar/note.md`, prefix stays as
- * `foo\bar`).
+ * The stored form is `PathPolicy.normalize()`'s — the form a vault path
+ * reaches the plugin in — so a prefix and a candidate compare directly. A
+ * prefix kept as written (`foo\bar`, `./private`, `journal//therapy`) would
+ * match no vault path: a refusal for an allowlist, and a deny entry that
+ * silently denies nothing.
  */
 const envPathList = z
   .preprocess(
@@ -63,7 +65,7 @@ const envPathList = z
             });
             return z.NEVER;
           }
-          const segments = raw.split(/[\\/]/);
+          const segments = raw.split(/[\\/]/).filter((s) => s !== '' && s !== '.');
           if (segments.includes('..')) {
             ctx.addIssue({
               code: 'custom',
@@ -71,8 +73,14 @@ const envPathList = z
             });
             return z.NEVER;
           }
-          const normalized = raw.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
-          if (normalized.length === 0) continue;
+          if (segments.length === 0) {
+            ctx.addIssue({
+              code: 'custom',
+              message: `must name a folder or note, not the vault root; got '${raw}'`,
+            });
+            return z.NEVER;
+          }
+          const normalized = segments.join('/').toLowerCase().normalize('NFC');
           if (seen.has(normalized)) continue;
           seen.add(normalized);
           out.push(normalized);
@@ -101,8 +109,8 @@ const ServerConfigSchema = z.object({
     /**
      * Normalized here rather than at each `${baseUrl}${path}` join: the schema
      * is the one place that runs before anything reads the value, so a single
-     * transform covers `#request`, the HEAD size probe, the capability probe,
-     * and `deriveOmnisearchUrl` alike (issue #121).
+     * transform covers `#request` (the HEAD size probe included), the
+     * capability probe, and `deriveOmnisearchUrl` alike (issue #121).
      */
     .transform((url) => url.replace(/\/+$/, '')),
   verifySsl: envBoolean
@@ -114,30 +122,42 @@ const ServerConfigSchema = z.object({
     .number()
     .int()
     .positive()
+    // The longest delay a timer takes; past it both runtimes fire after 1 ms.
+    .max(2_147_483_647)
     .default(30_000)
-    .describe('Per-request timeout in milliseconds.'),
+    .describe(
+      'Milliseconds (at most 2147483647) one attempt at a Local REST API request — headers and body — may take before it fails with `obsidian_timeout`; an Omnisearch query past it fails with `omnisearch_unreachable`. GET, PUT, and DELETE retry a timed-out attempt, and every Local REST API request one tool or resource call makes shares a budget of 45 s, or of this value when it is longer.',
+    ),
   enableCommands: envBoolean
     .default(false)
     .describe(
       'Opt-in flag for the command-palette pair (`obsidian_list_commands` + `obsidian_execute_command`). Off by default — Obsidian commands are opaque and can be destructive.',
     ),
   readPaths: envPathList.describe(
-    'Optional vault-relative folder allowlist for read operations. Comma-separated; prefix-based with implicit recursion; case-insensitive; trailing slashes normalized. Unset = full vault.',
+    'Optional vault-relative folder allowlist for read operations. Comma-separated; prefix-based with implicit recursion; case-insensitive; backslashes read as slashes, repeated and trailing slashes and `.` segments dropped, and names normalized to Unicode NFC; an entry naming the vault root (`.`) is rejected at startup. Unset = full vault.',
   ),
   writePaths: envPathList.describe(
-    'Optional vault-relative folder allowlist for write operations. Same syntax as OBSIDIAN_READ_PATHS. Write paths are implicitly readable. Unset = full vault.',
+    'Optional vault-relative folder allowlist for write operations. Same syntax as OBSIDIAN_READ_PATHS. Write paths are implicitly readable. Unset = full vault, or the read scope when reads are restricted; paths in OBSIDIAN_DENY_PATHS stay denied.',
+  ),
+  denyPaths: envPathList.describe(
+    'Optional vault-relative blocklist for reads and writes alike. Same syntax as OBSIDIAN_READ_PATHS. Wins over both allowlists: a denied path is unreadable and unwritable, and absent from listings, search results, and tag counts. Unset = nothing denied.',
   ),
   readOnly: envBoolean
     .default(false)
     .describe(
       'Global kill switch. When true, denies every write regardless of OBSIDIAN_WRITE_PATHS, and suppresses the OBSIDIAN_ENABLE_COMMANDS pair (commands can mutate). Defaults to false.',
     ),
+  deleteElicitation: envBoolean
+    .default(false)
+    .describe(
+      'When true, `obsidian_delete_note` asks the user to confirm each delete through an elicitation round, and HTTP startup requires a stateful session (MCP_SESSION_MODE=stateless is refused) unless OBSIDIAN_READ_ONLY=true, which disables the tool. Defaults to false: the delete runs on the first call, bounded by OBSIDIAN_WRITE_PATHS and OBSIDIAN_READ_ONLY.',
+    ),
   omnisearchUrl: z
     .string()
     .url()
     .optional()
     .describe(
-      'Override URL for the Omnisearch plugin HTTP server. When unset, derives from OBSIDIAN_BASE_URL host with port 51361 (falling back to http://localhost:51361). Used to enable the optional `omnisearch` mode on `obsidian_search_notes`; if the URL is unreachable at startup, the mode is omitted from the tool schema.',
+      'Override URL for the Omnisearch plugin HTTP server. When unset, derives from OBSIDIAN_BASE_URL host with port 51361 (falling back to http://localhost:51361). Used to enable the optional `omnisearch` mode on `obsidian_search_notes`; if the URL is unreachable at startup, the mode is omitted from the tool schema. Under OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS the mode is withheld and the URL is never called: Omnisearch ranks and selects its results over the whole vault, so they depend on notes outside the scope.',
     ),
 });
 
@@ -154,7 +174,9 @@ export function getServerConfig(): ServerConfig {
     enableCommands: 'OBSIDIAN_ENABLE_COMMANDS',
     readPaths: 'OBSIDIAN_READ_PATHS',
     writePaths: 'OBSIDIAN_WRITE_PATHS',
+    denyPaths: 'OBSIDIAN_DENY_PATHS',
     readOnly: 'OBSIDIAN_READ_ONLY',
+    deleteElicitation: 'OBSIDIAN_DELETE_ELICITATION',
     omnisearchUrl: 'OBSIDIAN_OMNISEARCH_URL',
   });
   return _config;

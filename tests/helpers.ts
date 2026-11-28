@@ -12,7 +12,12 @@
  * @module tests/helpers
  */
 
+import type { AnyToolDefinition, z } from '@cyanheads/mcp-ts-core';
 import type { McpError } from '@cyanheads/mcp-ts-core/errors';
+import { runToolContract } from '@cyanheads/mcp-ts-core/testing';
+import globToRegExp from 'glob-to-regexp';
+import jsonLogic from 'json-logic-js';
+import { Lexer, type Token } from 'marked';
 import { Headers, type HeadersInit, Response } from 'undici';
 import { afterEach, beforeEach, expect } from 'vitest';
 import type { ServerConfig } from '@/config/server-config.js';
@@ -21,8 +26,64 @@ import {
   ObsidianService,
   setObsidianService,
 } from '@/services/obsidian/obsidian-service.js';
+import type { NoteTarget } from '@/services/obsidian/types.js';
 
 export const TEST_BASE_URL = 'https://obsidian.test';
+
+const NAMED_ENTITIES = new Map([
+  ['amp', '&'],
+  ['lt', '<'],
+  ['gt', '>'],
+  ['quot', '"'],
+]);
+
+/** Decodes the character references a `marked` text token keeps verbatim. */
+function decodeEntities(text: string): string {
+  return text.replace(/&(#[xX][0-9a-fA-F]+|#\d+|[a-z]+);/g, (entity, name: string) => {
+    if (name[1] === 'x' || name[1] === 'X') {
+      return String.fromCodePoint(Number.parseInt(name.slice(2), 16));
+    }
+    if (name.startsWith('#')) return String.fromCodePoint(Number(name.slice(1)));
+    return NAMED_ENTITIES.get(name) ?? entity;
+  });
+}
+
+/** Block tokens whose `tokens` are blocks, joined line by line rather than inline. */
+const BLOCK_CONTAINERS = new Set(['blockquote', 'list_item']);
+
+function tokenText(token: Token): string {
+  switch (token.type) {
+    case 'space':
+      return '';
+    case 'br':
+      return '\n';
+    case 'code':
+    case 'codespan':
+    case 'escape':
+    case 'html':
+      return token.text;
+    case 'list':
+      return token.items.map(tokenText).join('\n');
+  }
+  if ('tokens' in token && token.tokens) {
+    return token.tokens.map(tokenText).join(BLOCK_CONTAINERS.has(token.type) ? '\n' : '');
+  }
+  return 'text' in token ? decodeEntities(token.text) : '';
+}
+
+/**
+ * The text a Markdown reader sees in `markdown`, one line per block: lexed by
+ * `marked` (the CommonMark/GFM parser this server already depends on), markup
+ * dropped, escapes and character references resolved, a hard break read as a
+ * line break. `content[]` escapes upstream and error text, so this reads back
+ * exactly what `structuredContent` carries.
+ */
+export function markdownText(markdown: string): string {
+  return Lexer.lex(markdown)
+    .filter((token) => token.type !== 'space')
+    .map(tokenText)
+    .join('\n');
+}
 
 /**
  * Build a stub upstream response. `ObsidianService` is typed against undici's
@@ -48,7 +109,9 @@ export function makeTestConfig(overrides: Partial<ServerConfig> = {}): ServerCon
     enableCommands: false,
     readPaths: undefined,
     writePaths: undefined,
+    denyPaths: undefined,
     readOnly: false,
+    deleteElicitation: false,
     ...overrides,
   };
 }
@@ -112,6 +175,112 @@ export async function rejectionOf<E = McpError>(p: Promise<unknown>): Promise<E>
     () => expect.unreachable('expected a rejection'),
     (e: unknown) => e as E,
   );
+}
+
+/** The error half of a tool's `structuredContent`, as `runToolContract` builds it. */
+export interface ContractError {
+  code: number;
+  data: Record<string, unknown>;
+  message: string;
+}
+
+/**
+ * Run `definition` through `runToolContract` — the production error pipeline,
+ * which fills a declared reason's contract `recovery` as `data.recovery.hint` —
+ * and hand back the envelope's error. Fails the test if the call succeeds.
+ */
+export async function contractErrorOf<T extends AnyToolDefinition>(
+  definition: T,
+  input: z.input<T['input']>,
+): Promise<ContractError> {
+  const res = await runToolContract(definition, input);
+  expect(res.isError).toBe(true);
+  return (res.structuredContent as { error: ContractError }).error;
+}
+
+/**
+ * Thread-CPU milliseconds per call of `run`: the fastest of up to three
+ * samples, each repeating `run` until it has used `floorMs` of CPU and dividing
+ * by the calls, so a call shorter than the clock's tick still reads true.
+ * Sampling stops once the fastest so far satisfies `enough`. CPU rather than
+ * wall-clock time, so a test worker descheduled under a parallel run cannot
+ * fail a cost budget.
+ */
+async function cpuMs(
+  run: () => unknown,
+  floorMs: number,
+  enough: (ms: number) => boolean = () => false,
+): Promise<number> {
+  let best = Number.POSITIVE_INFINITY;
+  for (let sample = 0; sample < 3; sample++) {
+    const start = process.threadCpuUsage();
+    let calls = 0;
+    let usedMs = 0;
+    do {
+      await run();
+      calls++;
+      const { user, system } = process.threadCpuUsage(start);
+      usedMs = (user + system) / 1000;
+    } while (usedMs < floorMs);
+    best = Math.min(best, usedMs / calls);
+    if (enough(best)) break;
+  }
+  return best;
+}
+
+/** CPU budget for one scan, at every size. */
+const BUDGET_MS = 1_000;
+
+/** Bound on the cost ratio across the span: the geometric midpoint of linear (64×) and quadratic (4,096×) growth. */
+const MAX_RATIO = 256;
+
+/**
+ * Asserts that `scan`, sync or async, costs linear time over `build`'s inputs,
+ * including calls too fast to time one at a time. Sizes double from `from` to
+ * 64× `from`, and each scans inside `BUDGET_MS` before the next is built, so a
+ * quadratic scan fails at the first size it outgrows rather than minutes later
+ * at the largest. Over the span a linear scan's cost grows ~64× and a
+ * quadratic one's ~4,096×, so the ratio must stay under `MAX_RATIO`, their
+ * geometric midpoint. The two ends are sampled at a 5 ms floor, and re-sampled
+ * alternately before a ratio fails. Each size's checks pass when its fastest
+ * sample does, so above `from` sampling stops at the first sample that passes
+ * them, the verdict the fastest of three would give; `from` keeps all three,
+ * since a slower baseline would lower the ratio.
+ */
+export async function expectLinearCost(
+  build: (size: number) => string,
+  scan: (input: string) => unknown,
+  from = 5_000,
+): Promise<void> {
+  const to = from * 64;
+  let smallMs = Number.POSITIVE_INFINITY;
+  let largeMs = Number.POSITIVE_INFINITY;
+  for (let size = from; size <= to; size *= 2) {
+    const input = build(size);
+    const ms =
+      size === from
+        ? await cpuMs(() => scan(input), 5)
+        : await cpuMs(
+            () => scan(input),
+            size === to ? 5 : 1,
+            (best) => best < BUDGET_MS && (size < to || best / smallMs < MAX_RATIO),
+          );
+    expect(ms, `${size} characters`).toBeLessThan(BUDGET_MS);
+    if (size === from) smallMs = ms;
+    if (size === to) largeMs = ms;
+  }
+  if (largeMs / smallMs >= MAX_RATIO) {
+    const small = build(from);
+    const large = build(to);
+    for (let round = 0; round < 3; round++) {
+      smallMs = Math.min(smallMs, await cpuMs(() => scan(small), 5));
+      largeMs = Math.min(largeMs, await cpuMs(() => scan(large), 5));
+    }
+  }
+  expect(
+    largeMs / smallMs,
+    `${largeMs.toFixed(2)} ms at ${to} characters, ${smallMs.toFixed(3)} ms at ${from}`,
+  ).toBeLessThan(MAX_RATIO);
 }
 
 /**
@@ -340,4 +509,256 @@ function servesAFile(opts: DispatchOpts, body: unknown): boolean {
 /** Left percent-encoded — `Headers` rejects values outside Latin-1, and the service only reads the header's presence. */
 function fileNameOf(path: string): string {
   return path.split('?')[0]?.slice('/vault/'.length) ?? path;
+}
+
+const PERIODS = ['daily', 'weekly', 'monthly', 'quarterly', 'yearly'] as const;
+
+/** Every `active` / `periodic` target form, each with the label a path-policy denial names it by. */
+export const NON_PATH_TARGETS: ReadonlyArray<readonly [NoteTarget, string]> = [
+  [{ type: 'active' }, '(active file)'],
+  ...PERIODS.flatMap((period) => [
+    [{ type: 'periodic', period }, `${period} note for the current period`] as const,
+    [{ type: 'periodic', period, date: '2026-10-01' }, `${period} note for 2026-10-01`] as const,
+  ]),
+];
+
+/** The two notes {@link installMovingTargetVault} holds, and their opening content. */
+export const MOVING_TARGET_NOTES = {
+  first: 'Work/a.md',
+  second: 'Private/b.md',
+  body: (path: string) => `---\nstatus: draft\n---\nbody of ${path}\n`,
+} as const;
+
+/**
+ * A two-note vault whose `active` and `periodic` routes move after their first
+ * read: the first request to `/active/` or `/periodic/…` resolves to
+ * `Work/a.md`, every later one to `Private/b.md`. Both routes and `/vault/`
+ * paths serve `note+json` built from the current content — or, under the
+ * document-map `Accept`, a 1.x map whose headings are the note's `#` lines —
+ * HEAD answers each note's size, PUT replaces a note's content, `GET /`
+ * reports plugin v4.2.0, and every request is recorded as `METHOD /path`.
+ * Installs a fresh service with `config` and returns it.
+ */
+export function installMovingTargetVault(config: Partial<ServerConfig> = {}): {
+  notes: Record<string, string>;
+  requests: string[];
+  service: ObsidianService;
+} {
+  const { first, second, body } = MOVING_TARGET_NOTES;
+  const notes: Record<string, string> = { [first]: body(first), [second]: body(second) };
+  const requests: string[] = [];
+  let moved = false;
+
+  const fetchImpl: ObsidianFetch = async (url, init) => {
+    const route = decodeURIComponent(new URL(url).pathname);
+    const method = (init.method ?? 'GET').toUpperCase();
+    requests.push(`${method} ${route}`);
+    if (route === '/') {
+      return mockResponse(
+        JSON.stringify({
+          status: 'OK',
+          service: 'Obsidian Local REST API',
+          authenticated: true,
+          versions: { obsidian: '1.13.7', self: '4.2.0' },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      );
+    }
+    let path: string | undefined;
+    if (route === '/active/' || route.startsWith('/periodic/')) {
+      path = moved ? second : first;
+      moved = true;
+    } else if (route.startsWith('/vault/')) {
+      path = route.slice('/vault/'.length);
+    }
+    const content = path === undefined ? undefined : notes[path];
+    if (path === undefined || content === undefined) {
+      return mockResponse(JSON.stringify({ message: 'Not Found', errorCode: 40400 }), {
+        status: 404,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    if (method === 'PUT') {
+      notes[path] = String(init.body);
+      return mockResponse('', { status: 200 });
+    }
+    if (method === 'HEAD') {
+      return mockResponse('', {
+        status: 200,
+        headers: {
+          'content-type': 'text/markdown',
+          'content-disposition': 'attachment',
+          'content-length': String(Buffer.byteLength(content)),
+        },
+      });
+    }
+    if (
+      new Headers(normalizeHeaders(init.headers)).get('accept') ===
+      'application/vnd.olrapi.document-map+json'
+    ) {
+      const headings = content.split('\n').flatMap((line) => /^#+ (.+)$/.exec(line)?.[1] ?? []);
+      return mockResponse(JSON.stringify({ headings, blocks: [], frontmatterFields: ['status'] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'content-disposition': 'attachment' },
+      });
+    }
+    return mockResponse(
+      JSON.stringify({
+        path,
+        content,
+        frontmatter: { status: 'draft' },
+        tags: [],
+        stat: { ctime: 0, mtime: 0, size: Buffer.byteLength(content) },
+      }),
+      {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'content-disposition': 'attachment' },
+      },
+    );
+  };
+  const service = new ObsidianService(makeTestConfig(config), fetchImpl);
+  setObsidianService(service);
+  return { notes, requests, service };
+}
+
+/**
+ * A note in a {@link jsonLogicVault}. `links` are resolved targets — each must
+ * name another note in the vault — and `unresolvedLinks` link text with no
+ * note behind it; `backlinks` are derived from every note's `links`.
+ */
+export interface VaultNote {
+  content?: string;
+  frontmatter?: Record<string, unknown>;
+  links?: string[];
+  path: string;
+  tags?: string[];
+  unresolvedLinks?: string[];
+}
+
+/**
+ * The plugin's own operator set, registered on this thread's json-logic-js as
+ * Local REST API 5.x registers it in `VaultOperations`: pattern first, and
+ * `false` for a non-string operand rather than a throw.
+ */
+jsonLogic.add_operation('glob', (pattern, field) =>
+  typeof field === 'string' && typeof pattern === 'string'
+    ? globToRegExp(pattern).test(field)
+    : false,
+);
+jsonLogic.add_operation('regexp', (pattern, field) =>
+  typeof field === 'string' && typeof pattern === 'string'
+    ? new RegExp(pattern).test(field)
+    : false,
+);
+
+/** The plugin's hit test: `null`/`undefined`, `[]`, and `{}` drop a note. */
+function pluginTruthy(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === 'object') return Object.keys(value).length > 0;
+  return Boolean(value);
+}
+
+/**
+ * A stub fetch serving the two routes a JSONLogic search reads, the way Local
+ * REST API 5.x does. `POST /search/` (`searchJsonLogic`, plugin 5.2.0–5.5.2)
+ * evaluates the received tree against every note's context in vault order,
+ * out-of-scope notes included, with `content` read only when the tree's JSON
+ * contains `"content"`, and a throw on any note fails the whole search with a
+ * 400 naming that note. `GET /vault/{path}` (`_vaultGet`) answers one note's
+ * raw UTF-8 bytes as an attachment, or a 404 for a note not in the vault.
+ * Every request is recorded in `requests` as `METHOD path`, and every search
+ * body in `bodies`; `remove` takes a note out of the vault from then on. Any
+ * other route throws.
+ */
+export function jsonLogicVault(notes: readonly VaultNote[]): {
+  bodies: string[];
+  fetchImpl: ObsidianFetch;
+  remove: (path: string) => void;
+  requests: string[];
+} {
+  const backlinks = new Map<string, string[]>();
+  for (const note of notes) {
+    for (const target of note.links ?? []) {
+      backlinks.set(target, [...(backlinks.get(target) ?? []), note.path]);
+    }
+  }
+  const removed = new Set<string>();
+  const present = () => notes.filter((note) => !removed.has(note.path));
+  const bodies: string[] = [];
+  const requests: string[] = [];
+  const fetchImpl: ObsidianFetch = async (url, init) => {
+    init.signal?.throwIfAborted();
+    const path = decodeURIComponent(new URL(url).pathname);
+    const method = (init.method ?? 'GET').toUpperCase();
+    requests.push(`${method} ${path}`);
+    if (method === 'GET' && path.startsWith('/vault/')) {
+      const note = present().find((n) => n.path === path.slice('/vault/'.length));
+      if (!note) {
+        return mockResponse(JSON.stringify({ errorCode: 40400, message: 'Not Found' }), {
+          status: 404,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return mockResponse(new TextEncoder().encode(note.content ?? ''), {
+        status: 200,
+        headers: {
+          'content-type': 'text/markdown; charset=utf-8',
+          'content-disposition': `attachment; filename="${encodeURI(note.path)}"`,
+        },
+      });
+    }
+    if (path !== '/search/' || method !== 'POST') {
+      throw new Error(`jsonLogicVault serves POST /search/ and GET /vault/, got ${method} ${path}`);
+    }
+    const body = String(init.body);
+    bodies.push(body);
+    const tree: unknown = JSON.parse(body);
+    const includeContent = body.includes('"content"');
+    const results: Array<{ filename: string; result: unknown }> = [];
+    for (const note of present()) {
+      const context = {
+        tags: note.tags ?? [],
+        frontmatter: note.frontmatter ?? {},
+        stat: { ctime: 1, mtime: 2, size: new TextEncoder().encode(note.content ?? '').length },
+        path: note.path,
+        content: includeContent ? (note.content ?? '') : '',
+        links: note.links ?? [],
+        backlinks: backlinks.get(note.path) ?? [],
+        unresolvedLinks: note.unresolvedLinks ?? [],
+      };
+      let result: unknown;
+      try {
+        result = jsonLogic.apply(tree, context);
+      } catch (e) {
+        return mockResponse(
+          JSON.stringify({
+            errorCode: 40070,
+            message: `${(e as Error).message} (while processing ${note.path})`,
+          }),
+          { status: 400, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (pluginTruthy(result)) results.push({ filename: note.path, result });
+    }
+    return mockResponse(JSON.stringify(results), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  return { bodies, fetchImpl, remove: (path) => removed.add(path), requests };
+}
+
+/**
+ * A stub fetch whose every JSONLogic search returns one note, `path`, tagged
+ * `deep`, whose frontmatter nests `levels` objects deep. The response is
+ * written as text, so no serializer in the stub recurses over it; the
+ * service's `JSON.parse` does not recurse either.
+ */
+export function deepNoteFetch(path: string, levels: number): ObsidianFetch {
+  const frontmatter = `${'{"a":'.repeat(levels)}"leaf"${'}'.repeat(levels)}`;
+  const context = `{"tags":["deep"],"frontmatter":${frontmatter},"stat":{"ctime":1,"mtime":2,"size":0},"path":${JSON.stringify(path)},"content":""}`;
+  const body = `[{"filename":${JSON.stringify(path)},"result":${context}}]`;
+  return async () =>
+    mockResponse(body, { status: 200, headers: { 'content-type': 'application/json' } });
 }

@@ -1,18 +1,23 @@
 /**
  * @fileoverview Unit tests for the path-resolution helpers used by
- * obsidian_get_note / obsidian_delete_note / obsidian_open_in_ui.
+ * obsidian_get_note / obsidian_open_in_ui.
  * @module tests/tools/suggest-paths.test
  */
 
 import { forbidden, JsonRpcErrorCode, notFound } from '@cyanheads/mcp-ts-core/errors';
-import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { createMockContext, runToolContract } from '@cyanheads/mcp-ts-core/testing';
 import { describe, expect, it } from 'vitest';
 import {
+  didYouMean,
+  findCaseVariants,
   findSimilarPaths,
   withCaseFallback,
 } from '@/mcp-server/tools/definitions/_shared/suggest-paths.js';
+import { obsidianAppendToNote } from '@/mcp-server/tools/definitions/obsidian-append-to-note.tool.js';
+import { obsidianGetNote } from '@/mcp-server/tools/definitions/obsidian-get-note.tool.js';
+import { obsidianWriteNote } from '@/mcp-server/tools/definitions/obsidian-write-note.tool.js';
 import type { NoteTarget } from '@/services/obsidian/types.js';
-import { setupHarness } from '../helpers.js';
+import { expectLinearCost, rejectionOf, setupHarness } from '../helpers.js';
 
 const harness = setupHarness();
 
@@ -76,10 +81,11 @@ describe('findSimilarPaths', () => {
   });
 
   it('skips directory entries', async () => {
+    // `mynote.assets/` strips to `mynote` like a file would, so only the skip keeps it out.
     harness
       .current()
       .pool.intercept({ path: '/vault/', method: 'GET' })
-      .reply(200, { files: ['mynote/', 'mynote.md'] });
+      .reply(200, { files: ['mynote.assets/', 'mynote.md'] });
 
     const out = await findSimilarPaths(createMockContext(), harness.current().service, 'MyNote');
     expect(out).toEqual(['mynote.md']);
@@ -89,14 +95,18 @@ describe('findSimilarPaths', () => {
 describe('withCaseFallback', () => {
   const path = (p: string): NoteTarget => ({ type: 'path', path: p });
 
-  it('passes through non-path targets without listing the parent', async () => {
-    const out = await withCaseFallback(
-      createMockContext(),
-      harness.current().service,
-      { type: 'active' },
-      async () => 'ok',
-    );
-    expect(out).toEqual({ result: 'ok', resolvedPath: undefined });
+  it("passes a non-path target's NotFound through without a case fallback", async () => {
+    const orig = notFound('No active file', { reason: 'no_active_file' });
+    await expect(
+      withCaseFallback(
+        createMockContext(),
+        harness.current().service,
+        { type: 'active' },
+        async () => {
+          throw orig;
+        },
+      ),
+    ).rejects.toBe(orig);
   });
 
   it('returns target.path when the exact path resolves on the first try', async () => {
@@ -114,11 +124,17 @@ describe('withCaseFallback', () => {
     expect(out).toEqual({ result: 'body', resolvedPath: 'N.md' });
   });
 
-  it('re-throws non-NotFound errors verbatim', async () => {
+  it('re-throws non-NotFound errors verbatim, even when a case match exists', async () => {
+    harness
+      .current()
+      .pool.intercept({ path: '/vault/', method: 'GET' })
+      .reply(200, { files: ['n.md'] });
+
     const orig = forbidden('nope', { reason: 'x' });
     await expect(
-      withCaseFallback(createMockContext(), harness.current().service, path('N.md'), async () => {
-        throw orig;
+      withCaseFallback(createMockContext(), harness.current().service, path('N.md'), async (t) => {
+        if (t.type === 'path' && t.path === 'N.md') throw orig;
+        return 'body';
       }),
     ).rejects.toBe(orig);
   });
@@ -145,7 +161,25 @@ describe('withCaseFallback', () => {
     );
     expect(calls).toBe(2);
     expect(seen).toEqual(['N.md', 'n.md']);
-    expect(out).toEqual({ result: 'body-n.md', resolvedPath: 'n.md' });
+    expect(out).toEqual({ result: 'body-n.md', resolvedPath: 'n.md', requestedPath: 'N.md' });
+  });
+
+  it('reports requestedPath only when it substituted another path', async () => {
+    const exact = await withCaseFallback(
+      createMockContext(),
+      harness.current().service,
+      path('N.md'),
+      async () => 'body',
+    );
+    const passThrough = await withCaseFallback(
+      createMockContext(),
+      harness.current().service,
+      { type: 'active' },
+      async () => 'ok',
+    );
+    expect(exact).not.toHaveProperty('requestedPath');
+    expect(passThrough).toEqual({ result: 'ok', resolvedPath: undefined });
+    expect(passThrough).not.toHaveProperty('requestedPath');
   });
 
   it('throws Conflict when more than one case-insensitive match exists', async () => {
@@ -227,5 +261,167 @@ describe('withCaseFallback', () => {
         throw orig;
       }),
     ).rejects.toBe(orig);
+  });
+});
+
+/**
+ * A path an error names for the caller to send back renders as a code span in
+ * the text surface, where escaping would put a backslash into the copy
+ * (`\_inbox`); `structuredContent.error` carries it as before.
+ */
+describe('a path the caller copies back, on the text surface', () => {
+  const textOf = (res: Awaited<ReturnType<typeof runToolContract>>) =>
+    res.content.map((b) => (b as { text?: string }).text ?? '').join('\n');
+  const errorOf = (res: Awaited<ReturnType<typeof runToolContract>>) =>
+    (res.structuredContent as { error: { code: number; data: object; message: string } }).error;
+
+  it('renders a "did you mean" suggestion as code', async () => {
+    const { pool } = harness.current();
+    pool
+      .intercept({ path: '/vault/_inbox/Draft', method: 'GET' })
+      .reply(404, { message: 'absent' });
+    pool.intercept({ path: '/vault/_inbox/', method: 'GET' }).reply(200, { files: ['Draft.md'] });
+
+    const res = await runToolContract(obsidianGetNote, {
+      format: 'full',
+      target: { type: 'path', path: '_inbox/Draft' },
+    });
+
+    expect(errorOf(res)).toMatchObject({
+      code: JsonRpcErrorCode.NotFound,
+      message: 'Not found: _inbox/Draft. Did you mean: "_inbox/Draft.md"?',
+      data: { reason: 'note_missing', path: '_inbox/Draft', suggestions: ['_inbox/Draft.md'] },
+    });
+    expect(textOf(res)).toContain('Did you mean: "`_inbox/Draft.md`"?');
+    expect(textOf(res)).not.toContain('\\_inbox/Draft.md');
+  });
+
+  it('renders the case matches of an ambiguous path as code', async () => {
+    const { pool } = harness.current();
+    pool
+      .intercept({ path: '/vault/_inbox/draft.md', method: 'GET' })
+      .reply(404, { message: 'absent' });
+    pool
+      .intercept({ path: '/vault/_inbox/', method: 'GET' })
+      .reply(200, { files: ['Draft.md', 'DRAFT.md'] });
+
+    const res = await runToolContract(obsidianGetNote, {
+      format: 'full',
+      target: { type: 'path', path: '_inbox/draft.md' },
+    });
+
+    expect(errorOf(res)).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      message: `Ambiguous case-insensitive matches for '_inbox/draft.md': "_inbox/Draft.md", "_inbox/DRAFT.md".`,
+      data: { reason: 'ambiguous_path', matches: ['_inbox/Draft.md', '_inbox/DRAFT.md'] },
+    });
+    expect(textOf(res)).toContain('"`_inbox/Draft.md`", "`_inbox/DRAFT.md`"');
+  });
+
+  it('renders the existing note a refused whole-file append collided with as code', async () => {
+    const { pool } = harness.current();
+    pool
+      .intercept({ path: '/vault/_inbox/Case.md', method: 'HEAD' })
+      .reply(200, '', { headers: { 'content-length': '7' } });
+    pool.intercept({ path: '/vault/_inbox/Case.md', method: 'POST' }).reply(500, {
+      message: 'Internal Server Error\nFile already exists.',
+      errorCode: 50000,
+    });
+    pool.intercept({ path: '/vault/_inbox/', method: 'GET' }).reply(200, { files: ['case.md'] });
+
+    const res = await runToolContract(obsidianAppendToNote, {
+      target: { type: 'path', path: '_inbox/Case.md' },
+      content: 'y',
+    });
+
+    expect(errorOf(res)).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      message: `Note '_inbox/case.md' already exists, and this vault's filesystem treats '_inbox/Case.md' as the same file.`,
+      data: { reason: 'case_variant_exists', existingPath: '_inbox/case.md' },
+    });
+    expect(textOf(res)).toContain("Note '`_inbox/case.md`' already exists");
+  });
+
+  it('renders the existing note a whole-file write would clobber as code', async () => {
+    const { pool } = harness.current();
+    pool
+      .intercept({ path: '/vault/_inbox/Case.md', method: 'HEAD' })
+      .reply(200, '', { headers: { 'content-length': '7' } });
+    pool.intercept({ path: '/vault/_inbox/', method: 'GET' }).reply(200, { files: ['case.md'] });
+
+    const res = await runToolContract(obsidianWriteNote, {
+      target: { type: 'path', path: '_inbox/Case.md' },
+      content: 'y',
+    });
+
+    expect(errorOf(res)).toMatchObject({
+      code: JsonRpcErrorCode.Conflict,
+      message: `Note '_inbox/case.md' already exists, and this vault's filesystem treats '_inbox/Case.md' as the same file.`,
+      data: { reason: 'case_variant_exists', existingPath: '_inbox/case.md' },
+    });
+    expect(textOf(res)).toContain("Note '`_inbox/case.md`' already exists");
+  });
+});
+
+describe('didYouMean', () => {
+  it.each([
+    ['a bare message', 'Not found: a.md', 'Not found: a.md'],
+    ['a closing period', 'Not found: a.md.', 'Not found: a.md'],
+    ['a closing period and spaces', 'Not found: a.md.  ', 'Not found: a.md'],
+    ['two closing marks, of which one goes', 'Not found: a.md!?', 'Not found: a.md!'],
+    ['a period then a spaced period', 'x. . ', 'x. '],
+    ['a space before the closing period', 'x . \t', 'x '],
+    ['a trailing no-break space and line separator', 'x.\u{a0}\u{2028}', 'x'],
+    ['an interior space run', 'Not found: a   b.md', 'Not found: a   b.md'],
+    ['whitespace only', ' \n ', ''],
+    ['an empty message', '', ''],
+  ])('drops what `/[.!?]?\\s*$/` drops from %s', (_label, message, kept) => {
+    expect(message.replace(/[.!?]?\s*$/, '')).toBe(kept);
+    expect(didYouMean(message, ['b.md', 'c'])).toBe(`${kept}. Did you mean: "b.md", "c"?`);
+  });
+});
+
+/**
+ * The probes trim a caller-sized path and the error message that names it, so
+ * each is timed from 5k to 320k characters (`expectLinearCost`): a slash run
+ * inside the path, and a space run inside the message.
+ */
+describe('path probes / cost', () => {
+  it('lists the parent of a path holding a long slash run in linear time', async () => {
+    await expectLinearCost(
+      (n) => `x${'/'.repeat(n)}y.md`,
+      async (target) => {
+        harness
+          .current()
+          .pool.intercept({ path: '/vault/x/', method: 'GET' })
+          .reply(200, { files: ['Y.md'] });
+        const out = await findCaseVariants(createMockContext(), harness.current().service, target);
+        expect(out).toEqual({ exact: false, variants: [`${target.slice(0, -4)}Y.md`] });
+      },
+    );
+  });
+
+  it('suggests a near match for a path holding a long space run in linear time', async () => {
+    await expectLinearCost(
+      (n) => `a${' '.repeat(n)}b.md`,
+      async (target) => {
+        const near = target.slice(0, -3);
+        harness
+          .current()
+          .pool.intercept({ path: '/vault/', method: 'GET' })
+          .reply(200, { files: [near] });
+        const err = await rejectionOf(
+          withCaseFallback(
+            createMockContext(),
+            harness.current().service,
+            { type: 'path', path: target },
+            async () => {
+              throw notFound(`Not found: ${target}`, { path: target });
+            },
+          ),
+        );
+        expect(err.message).toBe(`Not found: ${target}. Did you mean: "${near}"?`);
+      },
+    );
   });
 });

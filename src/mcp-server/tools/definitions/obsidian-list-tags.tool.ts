@@ -1,16 +1,19 @@
 /**
  * @fileoverview obsidian_list_tags — the most-used tags in the vault, with usage counts.
- * Wraps the plugin's `/tags/` endpoint, then shapes it for an LLM caller: `nameRegex`
- * and `minCount` narrow the candidate set, the survivors are ordered by usage, and
- * `limit` keeps the exploratory zero-argument call bounded on a vault with a long
- * single-use tail. The `obsidian://tags` resource wraps the same endpoint but keeps
- * snapshot semantics — unsorted, uncapped — so the two surfaces differ by design.
+ * Wraps `ObsidianService.listTags` — the plugin's `/tags/` endpoint, or under
+ * OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS the tags of readable notes only, counted
+ * per note — then shapes it for an LLM caller: `nameRegex` and `minCount` narrow the
+ * candidate set, the survivors are ordered by usage, and `limit` keeps the exploratory
+ * zero-argument call bounded on a vault with a long single-use tail. The `obsidian://tags` resource wraps
+ * the same service call but keeps snapshot semantics — unsorted, uncapped — so the two
+ * surfaces differ by design.
  * @module mcp-server/tools/definitions/obsidian-list-tags.tool
  */
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
 import { getObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { inlineCode } from './_shared/markdown.js';
 import { nameRegexSafetyIssue } from './_shared/regex-safety.js';
 
 /** Bounded so the first exploratory call cannot return the whole tag distribution. */
@@ -23,7 +26,7 @@ const DEFAULT_TAG_LIMIT = 200;
 const MAX_TAG_LIMIT = 10_000;
 
 export const obsidianListTags = tool('obsidian_list_tags', {
-  description: `List the vault's tags with usage counts, ordered by count descending and capped at \`limit\` (default ${DEFAULT_TAG_LIMIT}) — the response says so when it withheld any. Includes hierarchical parents: \`work/tasks\` contributes to both \`work\` and \`work/tasks\`. Narrow with \`nameRegex\` for a known prefix or \`minCount\` to drop the single-use tail. To find notes by tag, use \`obsidian_search_notes\` in jsonlogic mode (e.g. \`{"in": ["work", {"var": "tags"}]}\`).`,
+  description: `List the vault's tags with usage counts, ordered by count descending and capped at \`limit\` (default ${DEFAULT_TAG_LIMIT}) — the response says so when it withheld any. Includes hierarchical parents: \`work/tasks\` contributes to both \`work\` and \`work/tasks\`. Narrow with \`nameRegex\` for a known prefix or \`minCount\` to drop the single-use tail. To find notes by tag, use \`obsidian_search_notes\` in jsonlogic mode, where a note's \`tags\` hold only its own tags as written: \`{"in": ["work", {"var": "tags"}]}\` matches \`work\` exactly, and \`{"some": [{"var": "tags"}, {"regexp": ["^work(/|$)", {"var": ""}]}]}\` adds its nested tags.`,
   annotations: { readOnlyHint: true, idempotentHint: true },
   input: z.object({
     nameRegex: z
@@ -56,7 +59,11 @@ export const obsidianListTags = tool('obsidian_list_tags', {
         z
           .object({
             name: z.string().describe('Tag name without the leading `#`.'),
-            count: z.number().describe('Usage count across the vault.'),
+            count: z
+              .number()
+              .describe(
+                'Times the tag, or a tag nested under it, occurs across the vault. When OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS is set: the number of readable notes carrying the tag or a tag nested under it.',
+              ),
           })
           .describe('A tag with its usage count.'),
       )
@@ -113,7 +120,6 @@ export const obsidianListTags = tool('obsidian_list_tags', {
       if (safetyIssue) {
         throw ctx.fail('regex_unsafe', `Unsafe nameRegex: ${safetyIssue}`, {
           nameRegex: input.nameRegex,
-          ...ctx.recoveryFor('regex_unsafe'),
         });
       }
       try {
@@ -122,7 +128,7 @@ export const obsidianListTags = tool('obsidian_list_tags', {
         throw ctx.fail(
           'regex_invalid',
           `Invalid nameRegex: ${(err as Error).message}`,
-          { nameRegex: input.nameRegex, ...ctx.recoveryFor('regex_invalid') },
+          { nameRegex: input.nameRegex },
           { cause: err },
         );
       }
@@ -160,7 +166,9 @@ export const obsidianListTags = tool('obsidian_list_tags', {
       ctx.enrich.notice(
         narrowing
           ? `No tags matched ${narrowing}. Loosen or drop the filters to widen the listing.`
-          : 'No tags found. The vault may have no tagged notes.',
+          : svc.policy.restrictsReads
+            ? 'No tags found in the notes the path policy makes readable.'
+            : 'No tags found. The vault may have no tagged notes.',
       );
     } else if (candidates.length > input.limit) {
       ctx.enrich.truncated({
@@ -178,7 +186,7 @@ export const obsidianListTags = tool('obsidian_list_tags', {
     const lines = [`**${result.tags.length} tags**${suffix ? ` · ${suffix}` : ''}`];
     if (result.tags.length > 0) {
       lines.push('');
-      for (const t of result.tags) lines.push(`- \`#${t.name}\` (${t.count})`);
+      for (const t of result.tags) lines.push(`- ${inlineCode(`#${t.name}`)} (${t.count})`);
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },
@@ -191,7 +199,7 @@ function describeFilters(filters: {
   limit?: number | undefined;
 }): string {
   const parts: string[] = [];
-  if (filters.nameRegex) parts.push(`nameRegex=\`${filters.nameRegex}\``);
+  if (filters.nameRegex) parts.push(`nameRegex=${inlineCode(filters.nameRegex)}`);
   if (filters.minCount !== undefined) parts.push(`minCount=${filters.minCount}`);
   if (filters.limit !== undefined) parts.push(`limit=${filters.limit}`);
   return parts.join(' · ');

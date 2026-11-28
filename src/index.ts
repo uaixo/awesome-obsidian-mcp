@@ -1,21 +1,25 @@
 #!/usr/bin/env node
 /**
  * @fileoverview obsidian-mcp-server entry point. Initializes the Obsidian
- * Local REST API service at module load so the Omnisearch probe can run
+ * Local REST API service at module load so Omnisearch availability is decided
  * before tools are constructed — `obsidian_search_notes` is built via a
- * factory that takes Omnisearch reachability as input, so the `omnisearch`
- * mode appears in the tool schema only when the plugin is actually reachable.
+ * factory that takes it as input, so the `omnisearch` mode appears in the tool
+ * schema only with reads unscoped and the plugin actually reachable.
  * @module index
  */
 
 import { createApp, disabledTool } from '@cyanheads/mcp-ts-core';
 import { requestContextService } from '@cyanheads/mcp-ts-core/utils';
 import { getServerConfig } from '@/config/server-config.js';
+import { buildInstructions } from '@/instructions.js';
 import { allPromptDefinitions } from '@/mcp-server/prompts/definitions/index.js';
 import { allResourceDefinitions } from '@/mcp-server/resources/definitions/index.js';
 import {
+  buildDeleteNoteTool,
   buildSearchNotesTool,
   commandToolDefinitions,
+  type OmnisearchAvailability,
+  omnisearchAvailability,
   readToolDefinitions,
   writeToolDefinitions,
 } from '@/mcp-server/tools/definitions/index.js';
@@ -26,60 +30,38 @@ const config = getServerConfig();
 const policy = new PathPolicy(config);
 
 /**
- * Init the service at module load (rather than inside `setup()`) so the
- * Omnisearch probe can run before tool construction. `setup()` runs after
- * tools are passed into `createApp()`, which is too late to influence the
+ * Init the service at module load (rather than inside `setup()`) so
+ * Omnisearch availability — the probe, or `withheld` under a read scope with
+ * no probe — is known before tool construction. `setup()` runs after tools
+ * are passed into `createApp()`, which is too late to influence the
  * search-notes schema.
  */
 initObsidianService(config);
 const obsidian = getObsidianService();
-const omnisearchReachable = await obsidian.probeOmnisearch();
+const omnisearch = await omnisearchAvailability(obsidian);
 
-const searchNotesTool = buildSearchNotesTool({ omnisearchReachable });
+const searchNotesTool = buildSearchNotesTool({ omnisearch });
+
+const writeToolSet = [
+  ...writeToolDefinitions,
+  buildDeleteNoteTool({ elicitation: config.deleteElicitation }),
+];
 
 /**
- * Build the server-level `instructions` string sent on every `initialize`.
- * Provides baseline orientation about the server and then layers in
- * deployment-specific lines (read-only mode, scoped paths, command-palette
- * toggle, Omnisearch availability) when those flags are active.
+ * The delete confirmation can run only when `obsidian_delete_note` is
+ * registered: `OBSIDIAN_READ_ONLY=true` disables it below, so the gate — and
+ * the session it needs — exists only with elicitation on and writes allowed.
  */
-function buildInstructions(): string {
-  const sections: string[] = [
-    'Use the `obsidian_*` tools to access the Obsidian vault via the Local REST API plugin: search, read, write, and patch notes, including targeted edits to headings, blocks, and YAML frontmatter. Notes are addressed by vault-relative path including the file extension (e.g. `Folder/Note.md`); tags support hierarchical `parent/child` notation, and counts roll up to parents.',
-  ];
-  if (config.readOnly) {
-    sections.push(
-      'Read-only mode is active (OBSIDIAN_READ_ONLY=true): every write tool rejects every path with `path_forbidden` / `read_only_mode`. `obsidian_open_in_ui` still opens notes that exist, but rejects an open against a missing path — Obsidian would create the file.',
-    );
-  } else if (!policy.isUnrestricted) {
-    const { readPaths, writePaths } = policy.describe();
-    const render = (scope: readonly string[] | string): string =>
-      typeof scope === 'string' ? scope : scope.map((p) => `'${p}'`).join(', ');
-    sections.push(
-      `Vault path policy is enforced. Readable: ${render(readPaths)}. Writable: ${render(writePaths)}. Paths outside scope reject with \`path_forbidden\` — error data carries the active scope so you can self-correct.`,
-    );
-  }
-  if (config.enableCommands && !config.readOnly) {
-    sections.push(
-      'Command-palette tools (`obsidian_list_commands`, `obsidian_execute_command`) are enabled and can fire any Obsidian command. Commands are opaque and may be destructive — prefer dedicated tools when one fits.',
-    );
-  }
-  if (omnisearchReachable) {
-    sections.push(
-      '`obsidian_search_notes` includes an `omnisearch` mode: BM25-ranked, typo-tolerant, with PDF/OCR coverage (via the Text Extractor plugin). Results cap at 50 upstream — narrow the query (quoted phrases, `-exclusion`, `path:` / `ext:` filters) to surface more.',
-    );
-  }
-  return sections.join('\n\n');
-}
+const deleteGateActive = config.deleteElicitation && !config.readOnly;
 
 const writeTools = config.readOnly
-  ? writeToolDefinitions.map((def) =>
+  ? writeToolSet.map((def) =>
       disabledTool(def, {
         reason: 'Disabled by OBSIDIAN_READ_ONLY=true.',
         hint: 'Unset OBSIDIAN_READ_ONLY (or set it to false) to enable write tools.',
       }),
     )
-  : writeToolDefinitions;
+  : writeToolSet;
 
 const commandTools =
   config.enableCommands && !config.readOnly
@@ -103,44 +85,77 @@ const { services } = await createApp({
   tools,
   resources: allResourceDefinitions,
   prompts: allPromptDefinitions,
-  instructions: buildInstructions(),
+  instructions: buildInstructions({
+    enableCommands: config.enableCommands,
+    omnisearch,
+    policy,
+    readOnly: config.readOnly,
+  }),
+  /** Root `skills/`, served as `skill://<name>/SKILL.md` to clients without the plugin. */
+  skills: 'skills',
   /**
+   * With `OBSIDIAN_DELETE_ELICITATION=true` (and writes allowed),
    * `obsidian_delete_note` confirms through `ctx.requestInput`, which a
-   * 2025-era HTTP client can only answer on a stateful session. Declared as the
-   * default, not a requirement — an explicit `MCP_SESSION_MODE=stateless` still
-   * starts; the delete confirmation is then refused with
-   * `client_capability_missing` on those clients.
+   * 2025-era HTTP client can only answer on a stateful session — under
+   * stateless HTTP the tool would be unusable for them. Required, not just
+   * defaulted, in that mode: over HTTP, a resolved `stateless` mode (an
+   * explicit `MCP_SESSION_MODE=stateless`) fails startup with a
+   * `ConfigurationError`. With the confirmation off, or the tool disabled by
+   * `OBSIDIAN_READ_ONLY=true`, nothing needs a session and `stateful` is only
+   * the default. stdio is never refused; `MCP_SESSION_MODE` has no effect there.
    */
-  sessionMode: 'stateful',
+  sessionMode: deleteGateActive
+    ? { default: 'stateful', require: 'stateful' }
+    : { default: 'stateful' },
   teardown: () => obsidian.close(),
 });
 
 /**
  * Startup banner — emitted after createApp() returns so the framework's
  * `logger.initialize()` has run; calls inside `setup()` happen pre-init and
- * are dropped. Operators check this against their config to verify the active
- * path policy. The active scope on `path_forbidden` errors echoes the same
- * data so the LLM (or operator) can self-correct without scrolling the log.
+ * are dropped. Operators check this against their config to verify the
+ * configured path lists and whether `obsidian_delete_note` asks before deleting
+ * (`deleteElicitation`, false under read-only like `enableCommands`, since
+ * the tool is disabled there). The server `instructions` and the active scope
+ * on `path_forbidden` errors state the effective scope instead (write paths
+ * are readable; a write needs read access), so the LLM (or operator) can
+ * self-correct without scrolling the log. The deny list (`denyPaths`, present
+ * when set) appears only here: the agent-facing surfaces say paths are
+ * withheld without naming them. `omnisearch` is the startup
+ * `omnisearchAvailability`; under a read scope it is `withheld` and the
+ * plugin was never probed.
  */
 const bannerCtx = requestContextService.createRequestContext({
   operation: 'startup',
   additionalContext: {
     ...policy.describe(),
     enableCommands: config.enableCommands && !config.readOnly,
+    deleteElicitation: deleteGateActive,
     omnisearchUrl: obsidian.omnisearchUrl,
-    omnisearchReachable,
+    omnisearch,
   },
 });
 services.logger.info('Path policy', bannerCtx);
 services.logger.info(
-  omnisearchReachable
-    ? `Omnisearch reachable at ${obsidian.omnisearchUrl} — \`omnisearch\` mode enabled on \`obsidian_search_notes\`.`
-    : `Omnisearch not reachable at ${obsidian.omnisearchUrl} — \`omnisearch\` mode omitted from \`obsidian_search_notes\`. Set OBSIDIAN_OMNISEARCH_URL or enable the Omnisearch plugin's HTTP server to use it.`,
+  (
+    {
+      offered: `Omnisearch reachable at ${obsidian.omnisearchUrl} — \`omnisearch\` mode enabled on \`obsidian_search_notes\`.`,
+      unreachable: `Omnisearch not reachable at ${obsidian.omnisearchUrl} — \`omnisearch\` mode omitted from \`obsidian_search_notes\`. Set OBSIDIAN_OMNISEARCH_URL or enable the Omnisearch plugin's HTTP server to use it.`,
+      withheld:
+        'Omnisearch not probed — `omnisearch` mode withheld from `obsidian_search_notes` because OBSIDIAN_READ_PATHS or OBSIDIAN_DENY_PATHS scopes reads. Omnisearch ranks and selects its results over the whole vault, so they depend on notes outside the scope; `text` and `jsonlogic` modes search the readable notes alone.',
+    } satisfies Record<OmnisearchAvailability, string>
+  )[omnisearch],
   bannerCtx,
 );
 if (policy.readOnlyShadowsWritePaths) {
   services.logger.warning(
     'OBSIDIAN_WRITE_PATHS is set but ignored because OBSIDIAN_READ_ONLY=true. Unset one of the two to remove the conflict.',
+    bannerCtx,
+  );
+}
+for (const { variable, prefix } of policy.denyShadowedPaths) {
+  services.logger.warning(
+    `${variable} entry '${prefix}' lies inside OBSIDIAN_DENY_PATHS and grants nothing. Remove it, or narrow the deny entry that covers it.`,
     bannerCtx,
   );
 }

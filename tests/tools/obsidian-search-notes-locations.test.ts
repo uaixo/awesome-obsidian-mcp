@@ -255,12 +255,16 @@ describe('obsidian_search_notes / text locations — the merge rule', () => {
   });
 
   it('never merges spans of a single distinct token, even of different text', async () => {
-    // `aa` over `aa aaaa`: two spans, 'aa' and the coalesced 'aaaa'.
-    const body = 'aa aaaa';
+    /**
+     * `aa` over `İ aa aa`: upstream's offsets index the lower-cased text, where
+     * `İ` is two characters, so each span's slice of the note sits one
+     * character late and the two read 'a ' and 'a'. Merging would join them.
+     */
+    const body = 'İ aa aa';
     const { result } = await run(body, 'aa', 10);
     expect(spansOf(result)).toEqual([
-      [0, 2, 'aa'],
-      [3, 7, 'aaaa'],
+      [3, 5, 'a '],
+      [6, 8, 'a'],
     ]);
   });
 
@@ -350,6 +354,9 @@ describe('obsidian_search_notes / text locations — properties', () => {
   it.each([11, 12, 13, 14])('seed %i', async (seed) => {
     const rand = seededRandom(seed);
     const pick = <T>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)] as T;
+    /** Guards against a seed whose runs never reach the multi-span partition checks. */
+    let unchangedRuns = 0;
+    let mergedLocations = 0;
     for (let run = 0; run < 60; run++) {
       const notes: SimulatedNote[] = [0, 1].map((n) => {
         const parts: string[] = [];
@@ -370,6 +377,7 @@ describe('obsidian_search_notes / text locations — properties', () => {
       expect(merged.bytes, label).toBeLessThanOrEqual(before.bytes);
       if (distinct < 2) {
         expect(merged.result.hits, label).toEqual(before.result.hits);
+        if (before.result.hits.length > 0) unchangedRuns++;
         continue;
       }
       for (const hit of merged.result.hits) {
@@ -384,6 +392,7 @@ describe('obsidian_search_notes / text locations — properties', () => {
           while (i < spans.length && (spans[i]?.match.end ?? 0) < loc.match.end) i++;
           expect(spans[i]?.match.end, label).toBe(loc.match.end);
           const covered = spans.slice(first, i + 1);
+          if (covered.length > 1) mergedLocations++;
           const kinds = new Set(subjects.slice(first, i + 1).map((t) => t.subject));
           expect(kinds.size, label).toBe(1);
           const texts = covered.map((s) => sliceOf(s).toLowerCase());
@@ -399,5 +408,7 @@ describe('obsidian_search_notes / text locations — properties', () => {
         expect(i, label).toBe(spans.length);
       }
     }
+    expect(unchangedRuns).toBeGreaterThan(0);
+    expect(mergedLocations).toBeGreaterThan(0);
   });
 });

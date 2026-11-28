@@ -4,7 +4,7 @@ description: >
   Scaffold a new MCP tool definition. Use when the user asks to add a tool, create a new tool, or implement a new capability for the server.
 metadata:
   author: cyanheads
-  version: "2.29"
+  version: "2.39"
   audience: external
   type: reference
 ---
@@ -19,18 +19,18 @@ Tools use the `tool()` builder from `@cyanheads/mcp-ts-core`. Each tool lives in
 2. **Determine if it needs input the caller may not supply** — a confirmation, a choice, the client's roots — which makes it a multi-round-trip handler (`ctx.requestInput` / `ctx.inputs`, see `api-context`)
 3. **Create the file** at `src/mcp-server/tools/definitions/{{tool-name}}.tool.ts`
 4. **Register** the tool in the project's existing `createApp()` tool list (directly in `src/index.ts` for fresh scaffolds, or via a barrel if the repo already has one)
-5. **Run `bun run devcheck`** to verify — if Biome reports formatting issues, run `bun run format` to auto-fix, then re-run devcheck
-6. **Smoke-test** with `bun run rebuild && bun run start:stdio` (or `start:http`)
+5. **Run `bun run devcheck`** to verify — it applies Biome's formatting fixes as it runs
+6. **Smoke-test** with `bun run rebuild && bun run start:stdio < /dev/null` (or `start:http`) — the `Core services constructed` log record must list the new tool in its `tools` field (the message text shows only counts); if it doesn't, the tool never reached `createApp()`
 
 ## Naming
 
-Tools use lowercase snake_case with a canonical server/domain prefix: `{server}_{verb}_{noun}` — 3 words.
+Tools use lowercase snake_case with a canonical server/domain prefix, `{server}_{verb}_{noun}` by default. Drop the noun only when the verb is a complete action on its own (`git_pull`, `git_status`): if `{server}_{verb}` leaves "…what?" unanswered — `search` what? `connect` to what? — the noun is missing. The full rule is the Name row of the `design-mcp-server` Design table.
 
 Examples: `pubmed_search_articles`, `pubmed_fetch_fulltext`, `clinicaltrials_find_eligible`.
 
 The server prefix is judged on clarity, not length: the brand name or the plain well-known word for the domain both pass (`pubmed_`, `patents_`); an abbreviation fails only when it reads as something else out of context (`loc_`, `ct_`). A fourth segment is fine when the noun is inherently two words (`openfda_search_device_clearances`). When a name resists the schema — can't pick a verb, noun feels generic, the *verb* wants a second word — that's usually a signal the scope is fuzzy; split the tool, rename, or reconsider.
 
-For shape selection (Workflow or Instruction variants — standard single-action tools are the default), see the `design-mcp-server` skill's Tool shapes section.
+For shape selection (Workflow, Instruction, or Reference variants — standard single-action tools are the default), see the `design-mcp-server` skill's Tool shapes section.
 
 ## Template
 
@@ -42,6 +42,7 @@ For shape selection (Workflow or Instruction variants — standard single-action
 
 import { tool, z } from '@cyanheads/mcp-ts-core';
 import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { escapeMarkdownInline } from '@cyanheads/mcp-ts-core/utils';
 
 export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
   title: '{{TOOL_TITLE}}',
@@ -80,8 +81,8 @@ export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
   // `recovery` is required (≥ 5 words) — it's the agent's next move when this
   // failure fires. Forcing function for thoughtful guidance: placeholders like
   // "Try again." get flagged by the linter. The contract `recovery` is the
-  // single source of truth for what flows to the wire — opt in at the throw
-  // site by spreading `ctx.recoveryFor('reason')` into the `data` arg.
+  // single source of truth for what flows to the wire — the framework sends it
+  // with any failure carrying the reason and no hint of its own.
   errors: [
     { reason: 'queue_full', code: JsonRpcErrorCode.RateLimited,
       when: 'Local queue at capacity.', retryable: true,
@@ -95,10 +96,9 @@ export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
     // Without: throw via factories (`notFound`, `validationError`, …) or plain `Error`.
     const items = await search(input);
     if (queue.full()) {
-      // Static recovery — resolve from the contract via ctx.recoveryFor('reason').
-      // Single source of truth: the string lives in errors[] above; this spread
-      // pulls it onto the wire so format()-only clients see the recovery hint.
-      throw ctx.fail('queue_full', undefined, { ...ctx.recoveryFor('queue_full') });
+      // Static recovery — the string lives in errors[] above, and the framework
+      // puts it on both client surfaces as `data.recovery.hint`.
+      throw ctx.fail('queue_full');
     }
     // Surface what the agent reasons with — echoed query, true total — on BOTH
     // client surfaces, with no format() plumbing. An empty result is a notice,
@@ -106,7 +106,10 @@ export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
     ctx.enrich.echo(input.query);
     ctx.enrich.total(items.length);
     if (items.length === 0) {
-      ctx.enrich.notice(`No items matched "${input.query}". Try broader terms or check the spelling.`);
+      // A notice is authored Markdown, so the caller's text inside it is escaped.
+      ctx.enrich.notice(
+        `No items matched "${escapeMarkdownInline(input.query)}". Try broader terms or check the spelling.`,
+      );
     }
     return { items };
   },
@@ -119,10 +122,13 @@ export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
     const lines: string[] = [];
     // Render each item with all relevant fields — not just a count or title.
     // A thin one-liner (e.g., "Found 5 items") leaves the model blind to the data.
+    // Upstream text goes through escapeMarkdownInline so it reads back as written.
     for (const item of result.items) {
-      lines.push(`## ${item.name}`);
-      lines.push(`**ID:** ${item.id} | **Status:** ${item.status}`);
-      if (item.description) lines.push(item.description);
+      lines.push(`## ${escapeMarkdownInline(item.name)}`);
+      lines.push(
+        `**ID:** ${escapeMarkdownInline(item.id)} | **Status:** ${escapeMarkdownInline(item.status)}`,
+      );
+      if (item.description) lines.push(escapeMarkdownInline(item.description));
     }
     return [{ type: 'text', text: lines.join('\n') }];
   },
@@ -137,29 +143,25 @@ A handler that needs something the caller didn't supply returns `ctx.requestInpu
 import { inputRequired, tool, z } from '@cyanheads/mcp-ts-core';
 import { validationError } from '@cyanheads/mcp-ts-core/errors';
 
-const Confirm = z.object({ confirm: z.boolean().describe('Whether to proceed.') });
+const Choice = z.object({ region: z.enum(['us', 'eu']).describe('Region to deploy to.') });
 
 export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
   description: '{{TOOL_DESCRIPTION}}',
   input: z.object({ /* ... */ }),
   output: z.object({ /* ... */ }),
-  annotations: { destructiveHint: true },
 
   handler(input, ctx) {
+    // A declined or cancelled prompt is a dead end — don't re-ask it.
+    const view = ctx.inputs.view('region');
+    if (view.kind === 'elicit' && view.action !== 'accept') {
+      throw validationError(`User ${view.action} the region prompt.`);
+    }
     // Read what a prior round collected before asking for anything.
-    const answer = ctx.inputs.accepted('confirm', Confirm);
+    const answer = ctx.inputs.accepted('region', Choice);
     if (!answer) {
-      // A declined or cancelled prompt is a dead end — don't re-ask it.
-      const view = ctx.inputs.view('confirm');
-      if (view.kind === 'elicit' && view.action !== 'accept') {
-        throw validationError(`User ${view.action} the confirmation.`);
-      }
       return ctx.requestInput({
         inputRequests: {
-          confirm: inputRequired.elicit({
-            message: `Proceed with ${input.target}?`,
-            requestedSchema: Confirm,
-          }),
+          region: inputRequired.elicit({ message: 'Which region?', requestedSchema: Choice }),
         },
       });
     }
@@ -168,6 +170,8 @@ export const {{TOOL_EXPORT}} = tool('{{tool_name}}', {
   },
 });
 ```
+
+**A confirmation before a destructive step is different.** `ctx.inputs` only carries response kinds the client declared, but a client that declared `elicitation` can still send an "accepted" answer on a call nothing asked, and any `requestState` replays within its lifetime. A consent gate stores `{ operation, clientId, subject, target, contentHash }` in `ctx.state` under a random id, sends only that id as `requestState`, redeems the record before anything else in the handler, and asks again on an unknown, used, or expired id or on any field that differs from this call — the full handler, and the concurrency limit an action that must not repeat has to design around, are in `api-context` § *Consent gates*. Pair it with `MCP_REQUEST_STATE_KEY` so a retry can only carry state this server minted.
 
 Write it as `return ctx.requestInput(...)` — the `never` return type makes it valid in return position for any output, and it is what lets TypeScript narrow the line below. Full reference (`inputRequired.elicitUrl` / `.createMessage` / `.listRoots`, `requestState`, decline handling): `framework-skills/api-context`.
 
@@ -243,7 +247,7 @@ const { enableWrites } = getServerConfig();
 
 // The suggestion is emitted only under the config that registers its target.
 const nextToolSuggestions = enableWrites
-  ? [{ toolName: 'brapi_submit_observations', args: { studyDbId } }]
+  ? [{ toolName: 'brapi_submit_observations', reason: 'Record the observations collected for this study.', args: { studyDbId } }]
   : [];
 
 return {
@@ -281,7 +285,7 @@ Two limits worth knowing when you write a schema:
 
 ### Three things the framework fixes before the schema sees the arguments
 
-Strict input is right for a misspelling the caller can fix, and wrong when the arguments the model wrote were correct and something between the model and the schema was not. An ordered step inside `parseToolArguments` covers those cases: **drop client-added keys → key aliases → parse → on failure, repair and one re-parse.** All three stages are on by default, none changes what `tools/list` advertises, and none appears in a response — each emits a debug log and a counter (`mcp.input.ignored_key`, `mcp.input.aliased`, `mcp.input.coerced`) instead, so a new client artifact surfaces in telemetry rather than as a failed call.
+Strict input is right for a misspelling the caller can fix, and wrong when the arguments the model wrote were correct and something between the model and the schema was not. An ordered step inside `parseToolArguments` covers those cases: **drop client-added keys → key aliases → parse → on failure, repair and one re-parse**, plus one alias-first retry when that still fails and the drop discarded a key (below). All three stages are on by default and none changes what `tools/list` advertises. A call they rescue carries nothing about them in its response — each change in the attempt your handler receives emits a debug log and a counter (`mcp.input.ignored_key`, `mcp.input.aliased`, `mcp.input.coerced`) instead, so a new client artifact surfaces in telemetry rather than as a failed call. A call they cannot rescue is rejected with the rewrites and underscore-rule drops of the order whose rejection it carries reported, as `data.input` and as closing hint sentences (`Validated query as targetQuery.`, `Dropped undeclared key _max.`), because the issues name only the keys that were validated and the caller could not otherwise tell a bad value from a moved or discarded key. Its issues name only what still fails once the repairs that held are applied (point 3).
 
 **1. Client-added root keys are dropped.** Some clients put their own keys inside `arguments`: a placeholder when the model sends none, a call description, a call id, or a `_meta` block that belongs on `params`. The model never wrote them and cannot remove them, so the retry fails identically. An undeclared root key is dropped when it is underscore-prefixed or on the built-in list (`_meta`, `tool_call_description`, `toolCallId`). Three boundaries: a declared key is never dropped (on a union root, that means every variant's keys); an author-opened root is left alone; and a tool declaring any underscore-prefixed key of its own switches the underscore rule off — otherwise a misspelled `_cursor` would vanish silently, which is the failure strict input exists to prevent.
 
@@ -297,9 +301,19 @@ export const drugProfile = tool('drug_profile', {
 
 Alongside those, an undeclared key whose case-folded form (`-`/`_` stripped, lowercased) names exactly one declared key is rewritten too — `max_results`, `Max-Results`, and `MAXRESULTS` all reach a declared `maxResults`, with nothing declared. Neither half advertises anything: `inputSchema` is byte-identical with or without `inputAliases`, so the canonical key keeps its place in `required` and the model is still told to use it.
 
-Declare an alias where the meaning is certain and the mapping is one-to-one — a sibling tool's spelling for the same concept, the upstream API's own name, a shorthand weaker models reach for. It is not fuzzy matching: a key matching no alias and no declared key is still rejected by name, with the accepted-key hint. Four boundaries: a rewrite applies only when the target key is absent (alias *and* target present fails exactly as it does today); an author-opened root is never rewritten; a union root resolves against the variant the discriminator selects, and rewrites nothing when the discriminator is absent or unrecognized; and a `headerParam`-designated target is never rewritten *to* — the SDK cross-checks the `Mcp-Param-<Name>` header against the raw body before dispatch, so a later rewrite would hand your handler a value no intermediary attested. `lint:mcp` rejects an alias that shadows a declared key, names a target that does not exist, or is ambiguous against another alias or key (`input-alias-conflict`).
+Declare an alias where the meaning is certain and the mapping is one-to-one — a sibling tool's spelling for the same concept, the upstream API's own name, a shorthand weaker models reach for. It is not fuzzy matching: a key matching no alias and no declared key is still rejected by name, with the accepted-key hint. Four boundaries: a rewrite applies only when the target key is absent (alias *and* target present is rejected, and the hint names the alias as one rather than as an unknown key: `drug_name is an alias of drug; send one of them, not both.`, or `send only one of them.` when three or more keys for one target arrive; an `_`-prefixed alias the drop discards is the exception, below); an author-opened root is never rewritten; a union root resolves against the variant the discriminator selects, and rewrites nothing when the discriminator is absent or unrecognized; and a `headerParam`-designated target is never rewritten *to* — the SDK cross-checks the `Mcp-Param-<Name>` header against the raw body before dispatch, so a later rewrite would hand your handler a value no intermediary attested. `lint:mcp` rejects an alias that shadows a declared key, names a target that does not exist or is `headerParam`-designated, or is ambiguous against another alias or key (`input-alias-conflict`).
 
-**3. A stringified array is repaired after the parse fails.** `statusFilter: "[\"RECRUITING\"]"` against `z.array(z.string())` is a serialization slip the server can undo with certainty — `JSON.parse` is the exact inverse of the `JSON.stringify` that produced it, which is what separates it from the nearest-key guessing strict input refuses. The repair runs *only* on the failure branch, *only* at the paths the rejection's own issues name, and is kept only if the repaired arguments then pass your schema. So it cannot touch a value that was already valid — a free-text field legitimately holding `"[1,2,3]"` is not in the issue list, so it survives untouched even when the same call carries a genuine stringified array in another field. It walks values only: no key is added, dropped, or renamed. When nothing validates, the original rejection is thrown verbatim: same code, message, `data.issues`, and `data.recovery.hint`.
+**3. A representation slip in a value is repaired after the parse fails.** Each repair undoes a slip the server can reverse with certainty, which is what separates a repair from the nearest-key guessing strict input refuses:
+
+- **A JSON-stringified array or object** — `statusFilter: "[\"RECRUITING\"]"` against `z.array(z.string())`, `target: "{\"type\":\"path\",\"path\":\"a.md\"}"` against an object or discriminated-union field — is parsed back: `JSON.parse` is the exact inverse of the `JSON.stringify` that produced it. A string whose trimmed form opens `[` or `{` is only ever read this way, even when it does not parse.
+- **A safe integer sent for a string** — `station_id: 8654467` against `z.string()` — becomes `"8654467"`: `String(n)` of a safe integer is the digits the caller sent.
+- **A string spelling a number or boolean where only those are accepted** — `maxResults: "15"` against `z.number()`, `includeMesh: "true"` against `z.boolean()` — becomes the one it spells. A number only when `String(n)` gives the trimmed string back (`"15"`, `"2.5"`, `"-3"`, `" 15 "`; never `"01"`, `"1e3"`, `"1.50"`, `"0x10"`, or a blank), a boolean only from `"true"` or `"false"`.
+- **A lone string sent for an array** — `parkCode: "yell"` against `z.array(z.string())` — becomes its only element, as sent. Never a blank string, and never one holding a comma or a line break: that may be a joined list, and splitting it is yours (below).
+- **`null` at an optional key** — `sort: null` against `z.enum([…]).optional()` — is deleted, so the field reads as unset and a `.default()` applies. Only at a key its enclosing `z.object()` declares, whose field refuses `null` and accepts `undefined`: a required field's `null`, a `z.record()` entry, a key under a catchall, and an array element keep their rejection, and a `.nullable()` field receives its `null`.
+
+The repair runs *only* on the failure branch, *only* at the paths the rejection's own issues name, once — a value one repair produced is never repaired again (`"2024"` against `z.array(z.number())` would need the wrap and then the number repair, so it stays rejected) — and is kept only if the repaired arguments then pass your schema. A stringified value or an integer at a path Zod's own issues name is tried first, written where the caller sent it, so `codes: "[\"USD\"]"` against a union of a code list and a string your transform splits on commas reaches your handler as `["USD"]` — beside a `count: "3"` sent for a number too, since that repair stays in place beside the ones that follow. Beyond that, the paths are the ones the rejection renders, so they reach inside a union field's one surviving branch exactly as the hint does: `ids: [123, "a"]` against `z.union([z.string(), z.array(z.string())])` reaches your handler as `["123", "a"]`, and a literal-tagged branch is repaired where its tag matches, as long as every other branch fails on its tag alone — one that also lacks a required field of its own leaves the union as sent. A tag no variant accepts is read as a field holding every variant's tag: `{ kind: "1" }` against variants tagged `z.literal(1)` and `z.literal(2)`, in a `z.discriminatedUnion()` or a plain union of tagged objects, reaches your handler as `{ kind: 1 }`, as does any field every branch of a plain union lists the values of. The gates below apply there as at any field, so `"01"`, `"3"`, or `"1"` beside a string-tagged variant keeps its rejection, and since the repaired tag selects a variant your schema never parsed, a second slip inside that variant is reported, not repaired with it. They also reach inside what a `z.preprocess()` made of a value: `items: { name: "abc", year: 2020 }` against a preprocess that wraps a lone object as a list reaches your handler as `[{ name: "abc", year: "2020" }]`. The repair is first written in place, at the issue path in the arguments as sent, and kept when your schema then accepts the call, so `[1, 2]` against a preprocess that reverses a list reaches your handler as `["2", "1"]`. Otherwise it is written into the preprocess's output, and that output replaces the argument only when your preprocess, applied to it, returns it unchanged — an equal copy counts; one that reorders it or rewrites a value in it keeps the call's rejection. When two branches fail inside the value (`[123]` against `z.union([z.array(z.string()), z.array(z.boolean())])`), neither is read, and a branch that takes a number at that path is reported as its own check, which no repair takes. So it cannot touch a value that was already valid: a free-text field legitimately holding `"[1,2,3]"` or `"{…}"` is not in the issue list, so it survives untouched even when the same call carries a genuine stringified value in another field. The scalar repairs are gated further, to issues that say the value failed for its type where the other reading is the only one. An integer becomes a string only where the issue refuses a number (a wrong type, a string-only enum, a union every branch of which refused the type): `-1` against `z.union([z.number().int().positive(), z.string()])` keeps its rejection instead of slipping past your constraint through the string branch, and `-0`, a fraction, or an integer past `Number.MAX_SAFE_INTEGER` is never repaired. A string becomes a number or boolean only where the field takes no string and no array: `"15"` against `z.union([z.number(), z.literal('auto')])` is a wrong string, not a number, and stays rejected. Neither that nor the list wrap applies at a field you route through `.transform()`, `.pipe()`, or `z.preprocess()`, nor at a key that another reading of the path routes that way — an option of a plain union, either side of an intersection, or a branch whose own tag the caller sent wrong: its rejection can describe your transform's output, so a name your lookup lacks stays rejected instead of becoming ID 15. Inside a union branch the gates read a value as a plain union of the branches would: `{ v: 6 }` against `z.union([z.object({ v: z.literal(5) }), z.object({ v: z.string() })])` stays rejected, as `6` against `z.union([z.literal(5), z.string()])` does. Your schema still decides the repaired value — `20260922` against `z.iso.date()` and `"0"` against `z.number().int().min(1)` stay rejected. Apart from a deleted `null`, no key is added, dropped, or renamed. When nothing validates, the rejection is a parse of the arguments with only the repairs that held applied — those no remaining issue sits at or below, apart from a size or range check (`too_big`, `too_small`, `not_multiple_of`) at the repaired value itself. A value your schema accepted once repaired is not reported: fourteen integer PMIDs against `z.array(z.string().regex(/^\d+$/)).max(10)` report only `pmids: Too big: expected array to have <=10 items`, not fourteen `Send pmids.N as a string` sentences ahead of it. The exception is a value that held only written in place under a preprocess that reorders or rewrites it: `[1, 2]` under the reversing one, beside a field that still fails, is reported as sent, since the issues name positions in the preprocess's output. A repaired value that fails only its own size or range check is reported by that check, exactly as a call sending the type gets it: `limit: "600"` against `z.number().int().min(1).max(500)` reports `limit: Too big: expected number to be <=500` rather than `Send limit as a number, not a string.`, a resend of which would fail on the bound. A value whose repair your schema otherwise refused — any other issue at the value, or one inside it — is reported as sent, so a call no repair helped gets exactly what it gets under `coerce: false` — as does one the held repairs alone would validate (only a union or a cross-field refinement allows that), held values included — and the rejection never mentions a repair.
+
+**When the drop took a key the alias stage wanted.** The drop runs first, so it also discards an underscore spelling of a declared key (`_query` for `query`), a declared `inputAliases: { _q: 'query' }`, and an ignore-listed key a declared alias names. If the call then fails, repair included, the step reruns both stages with the alias stage first, where those keys are rewritten instead, and keeps that retry only if it validates, again with its own repair. The retry never case-folds an ignore-listed key onto a declared one (`_meta` stays the client's even beside a declared `meta`), and still drops an underscore key it cannot resolve. It never changes which calls validate: `{ query: 'abc', _max_results: '12345' }` against an optional `maxResults: z.number()` validates with `_max_results` dropped, so the retry never runs. A call neither order validates gets the retry's rejection, which describes the arguments as the caller meant them: `{ _q: 'ab' }` against `query: z.string().min(3)` reports the too-short `query` and closes `Validated _q as query.`, not a missing `query` beside a dropped `_q`. A `_q` sent beside `query` is still dropped, and when the call fails on something else the hint names it as `_q is an alias of query; send one of them, not both.`, not as a dropped key.
 
 Turn any stage off per server — there is no per-tool switch:
 
@@ -308,13 +322,13 @@ await createApp({
   input: {
     ignoreKeys: ['some_client_field'], // adds to the built-in list; `false` disables the stage
     caseStyleAliases: false,           // declared `inputAliases` only
-    coerce: false,                     // never retry a failed parse
+    coerce: false,                     // never repair an argument value
   },
   tools: allToolDefinitions,
 });
 ```
 
-Those three stages are the whole of the framework's input edge: argument **key** names, and one **value** shape — a JSON-stringified array, which `JSON.parse` inverts with certainty. Every other value normalization is domain knowledge and belongs to the tool: the case or bare-leaf form of a code, a unit or vocabulary alias, a composite identifier assembled from two arguments, a delimiter-joined list, a spelled-out name. Which variants a given input accepts is decided per input at design time (`design-mcp-server` § *Parameter descriptions*) and applied at the head of the handler, on the unambiguous mappings only.
+Those three stages are the whole of the framework's input edge: argument **key** names, and the **value** shapes above — a JSON-stringified array or object, which `JSON.parse` inverts with certainty; a safe integer sent for a string, whose digits `String(n)` restores; a number or boolean sent as the string `String(n)` or `"true"`/`"false"` writes; a lone string sent for a list; and `null` sent for an optional field. Every other value normalization is domain knowledge and belongs to the tool: the case or bare-leaf form of a code, a unit or vocabulary alias, a composite identifier assembled from two arguments, a delimiter-joined list, a spelled-out name. Which variants a given input accepts is decided per input at design time (`design-mcp-server` § *Parameter descriptions*) and applied at the head of the handler, on the unambiguous mappings only.
 
 ### Multi-mode tools take a discriminated-union input
 
@@ -344,11 +358,11 @@ The handler dispatches on the discriminator and TypeScript narrows `input` to th
 
 What reaches the wire is `{"type": "object", "oneOf": [<branch>, …]}`: branches intact, each with its own `required` list and a `const`-tagged discriminator, `additionalProperties: false` on every one. Identical bytes on a 2025-11-25 and a 2026-07-28 connection — the legacy projection inspects `outputSchema` alone and never rewrites an input root.
 
-Three constraints:
+Four constraints:
 
 - **The union must be discriminated.** A bare `z.union(...)` is rejected: with no literal-tagged key the model has nothing to choose a branch by, and every variant's `required` would read as applying at once.
 - **`output` stays a flat `z.object`** — see the widening section below for why a non-object output root breaks the success path. When the *result* shape varies by mode, use a `kind` discriminator with presence-based optional fields and render each arm on field presence in `format()`.
-- **Portability is unmeasured at the parameter root.** `schema-root-oneof-portability` (strict mode only) says so; for Anthropic clients the union is the better shape, and flattening is the escape hatch if you target the widest vendor matrix.
+- **Claude clients flatten the union root.** The Anthropic Messages API rejects a top-level `oneOf` in `input_schema`, so Claude clients rewrite the root before the model sees it — and the rewrite keeps only the first branch's properties, with `required: []`. A tool that must work in Claude clients takes a flat `z.object()` with an enum discriminator, optional per-mode fields, each mode's required fields named in the discriminator's `.describe()`, and the combination checked in the handler. `schema-root-oneof-portability` (strict mode only) flags the union root. Tracked in [#510](https://github.com/cyanheads/mcp-ts-core/issues/510).
 - **A union root rules out `headerParam`.** See below — the branches sit under `oneOf`, which the reachability rule excludes.
 
 ### `headerParam` mirrors an argument into a request header
@@ -369,9 +383,9 @@ input: z.object({
 
 The emitted property carries `"x-mcp-header": "Region"` and nothing else about the field changes — description, type, validation, and requiredness are untouched. Order does not matter: `headerParam(z.string(), 'Region').describe('…')` and `headerParam(z.string().describe('…'), 'Region')` are the same schema.
 
-**It mirrors, it does not relocate.** When the body carries a value for a designated property, the matching `Mcp-Param-<Name>` header MUST be present and decode to an equal value; the SDK cross-checks the pair before dispatch and rejects a disagreement with `-32020` (`HeaderMismatch`, HTTP `400`). Absent or `null` in the body means no header is expected. **Your handler still reads the argument from `input`** — there is nothing new to do in the handler body.
+**It mirrors, it does not relocate.** When the body carries a value for a designated property, the matching `Mcp-Param-<Name>` header MUST be present and decode to an equal value; the SDK cross-checks the pair before dispatch and rejects a disagreement with `-32020` (`HeaderMismatch`, HTTP `400`). Absent or `null` in the body means no header is expected. **Your handler still reads the argument from `input`** — there is nothing new to do in the handler body. Browser clients need nothing extra either: the HTTP transport's CORS preflight allows `Mcp-Param-<Name>` for every designation on a registered tool, for each origin `MCP_ALLOWED_ORIGINS` accepts.
 
-**Where a designation is legal.** The property must be primitive-typed (`string`, `integer`, `number`, `boolean`) and statically reachable through a chain of `properties` keys. Top-level and nested `z.object()` fields qualify. These do not:
+**Where a designation is legal.** The property must be primitive-typed (`string`, `integer`, `boolean`; a `z.number()` emits `number`, which the spec excludes, so use `z.int()`) and statically reachable through a chain of `properties` keys. Top-level and nested `z.object()` fields qualify. These do not:
 
 | Placement | Why |
 |:--|:--|
@@ -386,7 +400,9 @@ Header names must be non-empty RFC 9110 tokens (no spaces, control characters, o
 
 ### The advertised `outputSchema` is widened
 
-The framework parses a successful result against the strict effective schema — `output`, extended with the `enrichment` block when one is declared — so a required field the handler never populated still fails loudly. What it *advertises* in `tools/list` is a widened projection of that schema: every success field optional, plus a declared `error` property describing the failure envelope.
+The framework parses a successful result once, strictly: the handler's return against `output`, then whatever the handler enriched against the `enrichment` block, merged onto that parsed value — so a required field the handler never populated, in either half, still fails loudly as `-32603` naming the contract it broke. What it *advertises* in `tools/list` is a widened projection of `output` extended with `enrichment`: every success field optional, plus a declared `error` property describing the failure envelope. The SDK re-validates `structuredContent` against the registered schema after the handler returns; the framework registers it with that check passed through, so a parsed value is never parsed a second time — a field whose parsed value is not valid input to it (`z.stringbool()`, `z.string().transform(…).pipe(z.number())`, a `z.codec()`) reaches the client as its parsed value, and a transform runs once.
+
+The handler's return type is `output`'s input side (`z.input`), the value the framework parses, and `ctx.enrich` takes the enrichment fields' input types; `format()` and `enrichmentTrailer.render` receive the parsed values. A `.default()` field may be left out of the return, and a `z.stringbool()` field is returned as `'true'` and formatted as `true`.
 
 The reason is client-side validation. A failing tool returns `structuredContent: { error: … }`, which can never satisfy a success-only schema; clients whose SDK validates `structuredContent` without first checking `isError` reject that envelope with `-32602` before the error ever reaches the agent. Widening the advertised schema is the only fix a server can ship, because the validator runs in the caller.
 
@@ -396,7 +412,7 @@ Practical consequence: **do not read the advertised schema as the contract your 
 
 `data.reason` inside that envelope stays an unconstrained string. An `errors[]` contract covers what the *handler* throws, but a service it calls can raise its own reason (the SQL gate's `denied_function`, a parser's `yaml_parse_failed`), and that reaches the wire verbatim — an enum of the declared reasons would reject precisely those envelopes, recreating the `-32602` the widening exists to prevent. The declared reasons are emitted as `examples` and spelled out in the description instead.
 
-**`error` is a reserved output field name.** `tool()` throws if `output` or `enrichment` declares one: on the wire a failure *is* `structuredContent.error`, so a success payload using the same key cannot be told apart from a failure. Rename it (`errorText`, `failureDetail`).
+**`error` is a reserved output field name.** `tool()` throws if `output` or `enrichment` declares one: on the wire a failure *is* `structuredContent.error`, so a success payload using the same key cannot be told apart from a failure. Rename it (`errorText`, `failureDetail`). An open root (`.passthrough()` / `.catchall()`) that returns an undeclared `error` key, or keeps one enriched from the service layer, fails the call as `-32603` naming the output (or enrichment) contract; a default root strips it. A passthrough tool proxying upstream JSON that can carry `error` renames or drops that key before returning.
 
 ## Tool Response Design
 
@@ -418,14 +434,16 @@ async handler(input, ctx) {
   const res = await search(input.query, input.limit);
   ctx.enrich.echo(res.parsed);   // → structuredContent.effectiveQuery + "Query: …" trailer
   ctx.enrich.total(res.total);   // → structuredContent.totalCount + "N total" trailer
-  if (res.items.length === 0) ctx.enrich.notice(`No matches for "${input.query}".`);
+  if (res.items.length === 0) {
+    ctx.enrich.notice(`No matches for "${escapeMarkdownInline(input.query)}".`); // authored Markdown
+  }
   return { items: res.items };   // enrichment never rides in the domain return
 },
 ```
 
-A *required* enrichment field the handler never populates fails the effective-output parse — surfacing the bug rather than dropping it silently. Enrichment keys must be disjoint from `output` keys (lint-enforced). The sections below are applications of this rule.
+A *required* enrichment field the handler never populates fails the enrichment parse — surfacing the bug rather than dropping it silently. Enrichment keys must be disjoint from `output` keys (lint-enforced). The sections below are applications of this rule.
 
-**Trailer rendering is a per-field call.** Each field's `content[]` trailer line resolves as: its kind-tag if set (`notice`/`total`/`echo`/`delta`), else the definition's per-field `enrichmentTrailer.render`/`label`, else the generic `**key:** value` (objects/arrays `JSON.stringify`'d). A structured (object/array) field with no `render` ships as a one-line JSON blob — the `enrichment-trailer-render` lint rule errors on that. Give it a renderer, or a `label` to relabel a scalar key:
+**Trailer rendering is a per-field call.** Each field's `content[]` trailer line resolves as: the definition's per-field `enrichmentTrailer.render` if set, else its kind-tag (`notice`/`total`/`echo`/`delta`), else the generic `**key:** value` with `label` replacing the key (objects/arrays `JSON.stringify`'d). A `render` therefore overrides a kind-tagged field's default line (a notice that needs escaping in `content[]` but not in `structuredContent`), while a `label` relabels only the generic and `delta` lines. A structured (object/array) field with no `render` ships as a one-line JSON blob — the `enrichment-trailer-render` lint rule errors on that. Give it a renderer, or a `label` to relabel a scalar key:
 
 ```typescript
 enrichment: {
@@ -434,11 +452,13 @@ enrichment: {
 },
 enrichmentTrailer: {
   totalFound: { label: 'Total Found' },                                  // → "**Total Found:** 2990"
-  appliedFilters: { render: (f) => `### Filters\n- Range: ${f.dateRange}` }, // markdown, not JSON
+  appliedFilters: { render: (f) => `### Filters\n- Range: ${escapeMarkdownInline(f.dateRange)}` }, // markdown, not JSON
 },
 ```
 
 `structuredContent` always keeps the full structured value; `enrichmentTrailer` only controls the human-facing `content[]` line.
+
+**Pass echo, delta, and generic values raw.** They are data, often a value the agent copies into its next call — a query, a cursor, SQL — so the framework renders their strings, and an object's JSON, as code literals: a code span (`` `cat:astro-ph*` ``), or a fenced block on its own lines when the value holds a line break. A query holding `*`, `[x](y)`, or a line-leading `- ` reads back as written with no backslash to carry into the next call, an empty string renders as nothing, and numbers, booleans, and `null` render as themselves. Escaping or backtick-wrapping first would show in `structuredContent` too. Authored text stays live Markdown — a `render` result, a `label`, the `total` line, the `notice` blockquote — so escape any untrusted text you embed in a `notice` or `render` yourself.
 
 ### Image / audio output belongs in `ctx.content`
 
@@ -453,6 +473,23 @@ async handler(input, ctx) {
 ```
 
 The alternative — declaring `previewData: z.string()` in `output` and emitting the block from `format()` — ships the bytes twice (once in `structuredContent`, once in the block). Reserve `output` for data the agent reasons over; route raw media through `ctx.content`. Test with `getContentBlocks(ctx)`. Full reference: `framework-skills/api-context` § `ctx.content`.
+
+### Upstream text in `format()` renders as itself
+
+`content[]` carries the same data as `structuredContent`, so a string the tool did not author — a title, a description, a caller-supplied name — must read back unchanged when a client parses the Markdown. Interpolate it through `escapeMarkdownInline()` from `@cyanheads/mcp-ts-core/utils`. It escapes only what can parse as syntax: `snake_case`, `AT&T`, and `<=50` stay as written, while `*`, backticks, `[x](y)`, `<b>`, and a line-leading `- ` or `#` come back literally. Image and link fields render through `markdownImage(alt, url)` and `markdownLink(label, url)`: a logo URL shows as an image rather than as escaped text, and a non-`http(s)` URL falls back to literal `label (url)`.
+
+```typescript
+format: (r) => [{
+  type: 'text',
+  text: [
+    `## ${escapeMarkdownInline(r.team.name)}`,
+    markdownImage(`${r.team.name} logo`, r.team.logoUrl),
+    escapeMarkdownInline(r.team.bio),
+  ].join('\n\n'),
+}],
+```
+
+Never defang a value (`https[:]//`, HTML entities): that changes the data on one surface only. Markdown the tool authors — headings, `**Label:**`, list markers — stays live; escape what goes inside it. The escaped value reads back in a paragraph, after a label, and in a heading, list item, block quote, or table cell. Headings and table cells hold one line, so keep multi-line values out of them: the escaper keeps a value with line breaks in one paragraph, list item, or quote through hard breaks, and a heading or table row ends at the break.
 
 ### Capped lists must disclose truncation
 
@@ -477,7 +514,7 @@ async handler(input, ctx) {
 
 Alternatively, if the upstream total is known, `ctx.enrich.total(n)` (writes `totalCount`) also satisfies the lint rule.
 
-**Threshold bound** — when the upstream total is unknowable but the list is sorted by the cap key, the smallest shown value is a rigorous upper bound on all omitted items (Fagin Threshold Algorithm). Pass it as `ceiling`:
+**Threshold bound** — when the upstream total is unknowable but the list is sorted by the cap key, the smallest shown value is a rigorous upper bound on every item after the page (Fagin Threshold Algorithm). On a later page of a descending list it does not bound the items before the offset, which rank at or above the first item shown, so describe the field as covering the items after the page. Pass it as `ceiling`:
 
 ```ts
 // items is sorted descending by count; anything hidden has count ≤ items.at(-1).count
@@ -539,7 +576,7 @@ async handler(input, ctx) {
 
 Single-item tools don't need this — they either succeed or throw. The partial success question only arises with array inputs.
 
-**Telemetry:** The framework automatically detects this pattern — when a handler result contains a non-empty `failed` array, the span gets `mcp.tool.partial_success`, `mcp.tool.batch.succeeded_count`, and `mcp.tool.batch.failed_count` attributes. No manual instrumentation needed.
+**Telemetry:** The framework automatically detects this pattern — when a handler result contains a non-empty `failed` array, the span gets `mcp.tool.partial_success`, `mcp.tool.batch.succeeded_count` (from the `succeeded` array), and `mcp.tool.batch.failed_count` attributes. No manual instrumentation needed. An `output` built with `partialResultSchema()` from `/utils` is read under its own `failedKey`/`succeededKey` instead — also after `.extend()`, `.pick()`, `.omit()`, or a `.shape` spread. `.partial()` and `.required()` rebuild the fields, so a schema derived that way falls back to the literal keys.
 
 ### Empty results need context
 
@@ -558,7 +595,7 @@ async handler(input, ctx) {
   const results = await search(input);
   if (results.length === 0) {
     ctx.enrich.notice(
-      `No items matched status="${input.status}" in project "${input.project}". `
+      `No items matched status="${escapeMarkdownInline(input.status)}" in project "${escapeMarkdownInline(input.project)}". `
         + `Try a broader status filter or verify the project name.`,
     );
   }
@@ -621,8 +658,8 @@ output: z.object({
 format: (result) => [{
   type: 'text',
   text: result.repos.map((repo) => [
-    `## ${repo.name}`,
-    `**ID:** ${repo.id}`,
+    `## ${escapeMarkdownInline(repo.name)}`,
+    `**ID:** ${escapeMarkdownInline(repo.id)}`,
     typeof repo.archived === 'boolean'
       ? `**Archived:** ${repo.archived ? 'Yes' : 'No'}`
       : '**Archived:** Not available',
@@ -633,7 +670,7 @@ format: (result) => [{
 }],
 ```
 
-**A parsed value is the same problem one step later.** `Number(raw)` over an absent or non-numeric upstream field yields `NaN`; a missing nested path yields `null` or `undefined`. Against a required `z.number()` / `z.string()` each of those fails the effective-output parse, and the agent gets an internal error in place of a record the tool otherwise had. Guard where the value is parsed, not at the schema: when a documented-sparse feed supplies nothing usable for a field, omit it (declare it `.optional()`, render it `Not available`) rather than passing a `NaN`, a `null`, or a coerced `0` into the return. Decide per field which upstream absences are expected — the honesty rule above, applied to values the server computes rather than copies.
+**A parsed value is the same problem one step later.** `Number(raw)` over an absent or non-numeric upstream field yields `NaN`; a missing nested path yields `null` or `undefined`. Against a required `z.number()` / `z.string()` each of those fails the output parse, and the agent gets an internal error in place of a record the tool otherwise had. Guard where the value is parsed, not at the schema: when a documented-sparse feed supplies nothing usable for a field, omit it (declare it `.optional()`, render it `Not available`) rather than passing a `NaN`, a `null`, or a coerced `0` into the return. Decide per field which upstream absences are expected — the honesty rule above, applied to values the server computes rather than copies.
 
 ### Error classification and messaging
 
@@ -655,10 +692,9 @@ export const fetchArticles = tool('fetch_articles', {
   input: z.object({ pmids: z.array(z.string()).describe('PMIDs to fetch') }),
   output: z.object({ articles: z.array(ArticleSchema).describe('Resolved articles') }),
   async handler(input, ctx) {
-    // Static recovery — ctx.recoveryFor pulls the contract recovery onto the wire.
-    // The contract is the single source of truth; this spread surfaces it on the
-    // wire so format()-only clients see the hint mirrored into content[] text.
-    if (queue.full()) throw ctx.fail('queue_full', undefined, { ...ctx.recoveryFor('queue_full') });
+    // Static recovery — the framework fills the contract recovery onto the wire,
+    // mirrored into content[] text for format()-only clients.
+    if (queue.full()) throw ctx.fail('queue_full');
 
     const articles = await fetch(input.pmids);
     if (articles.length === 0) {
@@ -673,20 +709,22 @@ export const fetchArticles = tool('fetch_articles', {
 });
 ```
 
-**`ctx.recoveryFor(reason)`** resolves the contract's `recovery` string into the wire shape `{ recovery: { hint } }` — safe to spread into `data` so format()-only clients see the same recovery hint that structuredContent clients read. Always available on `Context` (no-op `{}` when no contract), strictly typed on `HandlerContext<R>` against the declared reasons. Use it for static recovery; pass `{ recovery: { hint: \`…${dynamic}…\` } }` directly when you need runtime context. The contract is the single source of truth — write the recovery once, lint validates it ≥5 words, the resolver carries it to every throw site.
+**The declared `recovery` reaches the wire on its own.** When a failure whose `data.reason` names a contract entry leaves the handler without `data.recovery`, the framework sets `data.recovery.hint` to that entry's `recovery` — both client surfaces, the error log record, and `runToolContract` alike — whatever code it was thrown with. Pass `{ recovery: { hint: \`…${dynamic}…\` } }` when you need runtime context; a throw-site hint always wins. `ctx.recoveryFor(reason)` still resolves the entry into `{ recovery: { hint } }` for a hint that must ride the thrown error itself. The contract is the single source of truth — write the recovery once, lint validates it ≥5 words, the framework carries it to every failure with that reason.
+
+**Throw raw text.** The framework renders the message, the recovery hint, and `data.reason` into `content[]` through `escapeMarkdownInline()`, so a name like `A*p*` or an upstream message with a line-leading `- ` reads back exactly as `structuredContent.error` carries it. Backticks or backslashes added in the handler would show on both surfaces. A value the caller must send back verbatim — a ticket, a cursor, a key name — goes in `literals` instead, so the model copying it gets no backslash: `throw ctx.fail('query_out_of_range', \`Ticket ${ticket} holds 2 queries.\`, { recovery: { hint: \`Re-call with ticket_id "${ticket}".\` } }, { literals: [ticket] })` renders each occurrence that no letter, digit, or `_` touches as a code span (`api-errors` § Error-path parity).
 
 **Baseline codes** (`InternalError`, `ServiceUnavailable`, `Timeout`, `ValidationError`, `SerializationError`) bubble freely and don't need declaring. Wire-level behavior is identical when the contract is omitted, but you lose the type-checked `ctx.fail`, the `tools/list` advertisement, and conformance lint coverage — declare a contract whenever the tool has a domain-specific failure mode.
 
-`ctx.fail` accepts an optional 4th `options` argument for ES2022 cause chaining: `throw ctx.fail('upstream_error', 'Upstream returned 500', { url }, { cause: e })`.
+`ctx.fail` accepts an optional 4th `options` argument, the error factories' own: `cause` for ES2022 chaining (`throw ctx.fail('upstream_error', 'Upstream returned 500', { url }, { cause: e })`) and `literals` (above).
 
 #### Service-layer throws
 
-API-wrapping tools usually delegate to a service: `await ncbi.fetch(input, ctx)`. The throw lives in the service, not the handler. Services accept `ctx` (the unified Context) so they can call `ctx.log`, `ctx.recoveryFor`, etc. The handler doesn't catch — it just bubbles, and the framework's auto-classifier preserves `data` on the wire.
+API-wrapping tools usually delegate to a service: `await ncbi.fetch(input, ctx)`. The throw lives in the service, not the handler. Services accept `ctx` (the unified Context) so they can call `ctx.log`, `ctx.state`, etc. The handler doesn't catch — it just bubbles, and the framework's auto-classifier preserves `data` on the wire.
 
-The contract entry on the tool and the `data: { reason }` on the service throw need to use the **same reason string** so the two sides line up. `ctx.recoveryFor('reason')` resolves the contract recovery from the calling tool's `errors[]` — same single-source-of-truth pattern that works in handlers.
+The contract entry on the tool and the `data: { reason }` on the service throw need to use the **same reason string** so the two sides line up. That reason is all it takes: the framework fills the calling tool's declared `recovery` onto the failure as it leaves the handler.
 
 ```typescript
-// service — receives ctx; passes data.reason and spreads ctx.recoveryFor
+// service — receives ctx; passes data.reason
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { serviceUnavailable } from '@cyanheads/mcp-ts-core/errors';
 
@@ -695,9 +733,8 @@ export class NcbiService {
     const response = await fetchWithRetry(...);
     if (!response.ok) {
       throw serviceUnavailable(`NCBI returned HTTP ${response.status}`, {
-        reason: 'ncbi_unreachable',
+        reason: 'ncbi_unreachable',  // the caller's declared recovery is filled from this
         status: response.status,
-        ...ctx.recoveryFor('ncbi_unreachable'),  // resolves from caller's contract
       });
     }
     return response.json();
@@ -717,7 +754,7 @@ export const fetchArticles = tool('fetch_articles', {
 });
 ```
 
-`ctx.recoveryFor` returns `{}` when the calling tool has no contract or the reason isn't declared, so the spread is always safe — services don't have to know which tool called them.
+A tool that declares no matching entry gets no hint — the service doesn't have to know which tool called it.
 
 Add `thrownBy: 'service'` to a contract entry the service produces once the handler also throws one of its own. `error-contract-unthrown` reads the handler body alone: as soon as one literal `ctx.fail(` appears there, every declared reason the body does not name is flagged, and the marker is what tells the rule this one is thrown a layer down. Lint-only metadata — the entry stays typed, advertised, and thrown exactly as an unmarked one.
 
@@ -746,9 +783,10 @@ throw serviceUnavailable(`arXiv API returned HTTP ${status}. Retry in a few seco
 // clients (Claude Desktop) see the same guidance that structuredContent clients
 // (Claude Code) read from `error.data.recovery.hint`. A hint the message already
 // contains verbatim is dropped from the text rather than stated twice; it stays
-// on structuredContent regardless. `data.reason` and `data.retryable` render as
-// a closing `(reason … · not retryable)` line; other `data` keys reach
-// structuredContent only.
+// on structuredContent regardless. `data.reason`, `data.retryable`,
+// `data.retryAfter`, and the framework's own `data.requestId` render as a
+// closing `(reason … · not retryable · retry after … · request <id>)` line;
+// other `data` keys reach structuredContent only.
 import { invalidParams } from '@cyanheads/mcp-ts-core/errors';
 throw invalidParams(
   `Date range exceeds 90-day API limit.`,
@@ -811,13 +849,28 @@ async handler(input, ctx) {
 
 The same applies to optional arrays — use `?.length` guards so empty arrays are skipped, not passed through.
 
+When an optional string field carries a validator (`.regex()` for a date, `.min(1)` for a cursor), a permissive schema would drop the validator and a strict one would reject the blank. Keep both by mapping the blank to `undefined` *before* the validator runs:
+
+```typescript
+/** A blank from a form client is "unset", never a value to validate. */
+const blankAsUnset = <T extends z.ZodType>(schema: T) =>
+  z.preprocess((value) => (value === '' ? undefined : value), schema);
+
+input: z.object({
+  d1: blankAsUnset(z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()).describe('Earliest date, YYYY-MM-DD.'),
+  cursor: blankAsUnset(z.string().regex(/^[1-9]\d*$/).optional()).describe('Opaque continuation from the previous page.'),
+}),
+```
+
+`toJSONSchema` emits only the inner schema for a preprocess pipe in both `io` modes, so the advertised `pattern` is unchanged; `''` parses to `undefined`, a real value still hits the validator, and a handler that tests the value (`input.d1 ?? default`, `if (input.d1)`) needs no extra guard. The key itself stays present (`'d1' in input` is `true`), so never test for the key or spread `input` into an upstream query. Because the advertised pattern still rejects `''`, keep the blank out of the `.describe()` text: "an empty string means unset" contradicts the schema a validating client reads. The blank is tolerated for form clients, not offered as input. The same holds for any spelling a preprocess normalizes — a `recid:` prefix, a case variant, a URL form: the advertised check states the canonical form, so the description offers only that form, or the check is widened to match what the description offers. Wrapping a number or boolean field this way also takes it out of the framework's string-spelling repair, which never reaches a field routed through `z.preprocess()`: `limit: "50"` behind `blankAsUnset(z.number().optional())` stays rejected unless the wrapper itself turns a spelled value into the number or boolean it spells, under the same `String(n)` round-trip rule.
+
 **Required fields are different.** If a string field is required and must be non-empty to be meaningful, `.min(1)` is correct — the client shouldn't have submitted the form without filling it in.
 
 ### Match response density to context budget
 
 Large payloads burn the agent's context window. Default to curated summaries; offer full data via opt-in parameters.
 
-- **Lists**: Return top N with a total count and pagination cursor, not unbounded arrays
+- **Lists**: Return exactly the caller's `limit` with a total count and pagination cursor, not unbounded arrays and never cut short by bytes. Keep the default conservative (about 25 short records, 10 or fewer heavy ones, never the cap) and clamp anything above one per-call cap with a notice instead of advertising a `.max()` (`design-mcp-server` § Parameter descriptions)
 - **Large objects**: Return key fields by default; accept a `fields` or `verbose` parameter for full data
 - **Binary/blob content**: Return metadata and a reference, not the raw content
 - **Analytical working sets**: When upstream returns more *analytical* rows (data an agent would SQL — aggregate, group, join) than fit in context, `DataCanvas` (`core.canvas`, wired in `setup()` via `setCanvas`; Tier 3 — opt-in via `CANVAS_PROVIDER_TYPE=duckdb`) lets you register the rows and return the `canvas_id` plus a preview so the agent can run SQL to slice down without a re-fetch. The `spillover()` helper (`@cyanheads/mcp-ts-core/canvas`) automates the overflow case: drain rows up to a character budget for the inline preview, auto-register the full source on overflow, return both as a discriminated union. **Two gates:** it must be analytical, not a discovery/search surface of categorical metadata (those don't earn a canvas regardless of row count — use MCP-side list filtering or pagination); and a tool emitting a `canvas_id` MUST be paired with a registered `dataframe_query` tool, or the handle is unreachable. Compute distributions or refinement hints across the full result — not the preview — so the agent gets honest aggregate signal on the rows it didn't read. Declare the *input* `canvas_id` field with `CanvasIdSchema` (`@cyanheads/mcp-ts-core/canvas`) rather than a bare `z.string()`: it advertises the 10-character URL-safe pattern in `inputSchema`, so a model sees the shape before it calls and a value that could never be an id is rejected at argument validation instead of after a registry lookup. Add your own `.describe()` over it to say which tool produced the id. The *output* field stays a plain `z.string()` — that id came from the server. See `api-canvas` for the register / query / export pattern and the spillover flow.
@@ -841,7 +894,7 @@ const hits = items.filter((it) => {
 });
 if (hits.length === 0) {
   ctx.enrich.notice(
-    `No name matched "${input.nameContains}". Call the tool without a filter to browse the full list.`,
+    `No name matched "${escapeMarkdownInline(input.nameContains)}". Call the tool without a filter to browse the full list.`,
   );
 }
 return { items: hits };
@@ -869,7 +922,7 @@ return { items: hits };
 - [ ] `errors: [...]` contract declared for the tool's domain-specific failure modes — or block deleted if no domain failures apply (baseline codes bubble freely)
 - [ ] Error contract declared inline on this tool — not imported from a shared module, even when other tools have near-identical entries
 - [ ] Long loops check `ctx.signal.aborted` so a cancelled request (or a closed transport) stops the work
-- [ ] If the tool needs caller input it may not have been given: reads `ctx.inputs` first, requests only what is missing via `return ctx.requestInput(...)`, and treats a declined/cancelled response as terminal rather than re-asking
+- [ ] If the tool needs caller input it may not have been given: reads `ctx.inputs` first, requests only what is missing via `return ctx.requestInput(...)`, and treats a declined/cancelled response as terminal rather than re-asking. A destructive confirmation redeems a `ctx.state` consent record bound to the operation, caller, and target (`api-context` § *Consent gates*) rather than trusting the answer alone
 - [ ] If tool returns unbounded arrays: pagination with total count, or `spillover()` / DataCanvas for *analytical* working sets (an agent would SQL them — not a discovery/search surface). If any tool emits a `canvas_id`, a `dataframe_query` tool is registered in the same server — a token with no query tool is dead output
 - [ ] If tool returns one large *document* (not a row set) that can overflow context: `outlineOnOverflow()` returns a `full | outline` union so the agent re-calls with `sections: [...]` — not one-sided truncation
 - [ ] If tool is feature-gated: evaluated whether `disabledTool()` wrapper is appropriate (present in manifest but uncallable)
@@ -878,4 +931,4 @@ return { items: hits };
 - [ ] Registered in the project's existing `createApp()` tool list (directly or via barrel)
 - [ ] Test file created via `add-test` skill, or handler tested directly with `createMockContext()`
 - [ ] `bun run devcheck` passes
-- [ ] Smoke-tested with `bun run rebuild && bun run start:stdio` (or `start:http`)
+- [ ] Smoke-tested with `bun run rebuild && bun run start:stdio < /dev/null` (or `start:http`); the `Core services constructed` record lists the new tool in its `tools` field

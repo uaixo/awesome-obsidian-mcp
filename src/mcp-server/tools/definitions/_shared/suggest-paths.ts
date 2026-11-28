@@ -4,22 +4,33 @@
  * 1. **Case-insensitive fallback.** If a path lookup 404s, list the parent
  *    directory and look for a single case-insensitive filename match. If
  *    found, retry against the canonical filesystem path (matches v2.x
- *    behavior). This silently fixes "Readme.md" vs "README.md" on Linux; on
- *    Mac/Windows the OS already case-folds and the fallback is a no-op.
+ *    behavior) and report the path that was asked for as `requestedPath`, so
+ *    the caller can disclose the substitution. The fallback is reachable on
+ *    every host: the plugin's `note+json` and document-map reads resolve
+ *    through Obsidian's case-sensitive vault index even on a case-insensitive
+ *    filesystem (macOS, Windows). Only the raw-markdown read case-folds there,
+ *    answering 200 for a wrong-case path before any fallback runs.
  *
  * 2. **"Did you mean" suggestions.** When no case match exists but the parent
  *    directory has near-matches (e.g., extension-stripped variants), re-throw
  *    NotFound enriched with the candidates in the message and
  *    `error.data.suggestions[]`.
  *
- * Read/open/delete tools wrap their service calls with `withCaseFallback`.
+ * 3. **Case-variant naming on writes.** A whole-file write never substitutes
+ *    a path, but on a case-insensitive filesystem a write to a case variant of
+ *    an existing note is refused (`case_variant_exists`); the same listing
+ *    names the note it collided with as `existingPath`.
+ *
+ * `obsidian_get_note` and `obsidian_open_in_ui` wrap their service calls with
+ * `withCaseFallback`; writes and deletes match the exact path.
  * @module mcp-server/tools/definitions/_shared/suggest-paths
  */
 
 import type { Context } from '@cyanheads/mcp-ts-core';
 import { conflict, JsonRpcErrorCode, McpError, notFound } from '@cyanheads/mcp-ts-core/errors';
-import type { ObsidianService } from '@/services/obsidian/obsidian-service.js';
+import { type ObsidianService, trimSlashes } from '@/services/obsidian/obsidian-service.js';
 import type { NoteTarget } from '@/services/obsidian/types.js';
+import { inlineCode } from './markdown.js';
 
 const MAX_SUGGESTIONS = 5;
 
@@ -30,6 +41,11 @@ interface ProbeResult {
   extInsensitive: string[];
 }
 
+/** Outcome of {@link withCaseFallback}; `requestedPath` is present only when another path was read. */
+export type CaseFallback<T> =
+  | { result: T; resolvedPath: string | undefined; requestedPath?: never }
+  | { result: T; resolvedPath: string; requestedPath: string };
+
 /**
  * Wrap a service call with case-insensitive path fallback and "did you mean"
  * enrichment. Non-path targets pass through — their paths are resolved
@@ -38,7 +54,7 @@ interface ProbeResult {
  * For path targets:
  *   - **Exact match** → returns `{ result, resolvedPath: target.path }`.
  *   - **Single case match** → retries with the canonical path and returns
- *     `{ result, resolvedPath: <canonical> }`.
+ *     `{ result, resolvedPath: <canonical>, requestedPath: target.path }`.
  *   - **Multiple case matches** → throws `Conflict` with the candidates so the
  *     agent can disambiguate.
  *   - **No case match, extension-stripped near-matches** → throws `NotFound`
@@ -47,13 +63,14 @@ interface ProbeResult {
  *
  * `resolvedPath` is `undefined` for non-path targets — callers derive the
  * canonical path from the result itself (typically `NoteJson.path`).
+ * `requestedPath` is present only on the single-case-match branch.
  */
 export async function withCaseFallback<T>(
   ctx: Context,
   svc: ObsidianService,
   target: NoteTarget,
   fn: (target: NoteTarget) => Promise<T>,
-): Promise<{ result: T; resolvedPath: string | undefined }> {
+): Promise<CaseFallback<T>> {
   if (target.type !== 'path') {
     return { result: await fn(target), resolvedPath: undefined };
   }
@@ -67,7 +84,7 @@ export async function withCaseFallback<T>(
     const sole = probe.caseMatches.length === 1 ? probe.caseMatches[0] : undefined;
     if (sole !== undefined) {
       const result = await fn({ type: 'path', path: sole });
-      return { result, resolvedPath: sole };
+      return { result, resolvedPath: sole, requestedPath: target.path };
     }
     if (probe.caseMatches.length > 1) {
       const list = probe.caseMatches.map((m) => `"${m}"`).join(', ');
@@ -77,29 +94,59 @@ export async function withCaseFallback<T>(
           path: target.path,
           reason: 'ambiguous_path',
           matches: probe.caseMatches,
-          ...ctx.recoveryFor('ambiguous_path'),
         },
-        { cause: err },
+        { cause: err, literals: probe.caseMatches },
       );
     }
     if (probe.extInsensitive.length === 0) throw err;
     const suggestions = probe.extInsensitive.slice(0, MAX_SUGGESTIONS);
-    const list = suggestions.map((s) => `"${s}"`).join(', ');
-    const prefix = err.message.replace(/[.!?]?\s*$/, '');
     throw notFound(
-      `${prefix}. Did you mean: ${list}?`,
+      didYouMean(err.message, suggestions),
       { ...(err.data ?? {}), suggestions },
-      { cause: err },
+      { cause: err, literals: suggestions },
     );
   }
+}
+
+/**
+ * A not-found `message` with `suggestions` appended as a "did you mean"
+ * question. The message's trailing whitespace, and one `.`, `!`, or `?` before
+ * it, are dropped first: what `/[.!?]?\s*$/` drops, in time linear in the
+ * message, where the regex retries at every whitespace run inside it.
+ */
+export function didYouMean(message: string, suggestions: readonly string[]): string {
+  const list = suggestions.map((s) => `"${s}"`).join(', ');
+  return `${message.trimEnd().replace(/[.!?]$/, '')}. Did you mean: ${list}?`;
+}
+
+/**
+ * Disclose a `withCaseFallback` substitution on the caller's enrichment: the
+ * `requestedPath` field plus a one-line notice naming both paths. `action` is
+ * what the tool did with the canonical file. Returns the notice — `notice` is
+ * last-wins, so a caller that sets another one must fold this text into it —
+ * or `undefined` when nothing was substituted.
+ */
+export function discloseCaseSubstitution(
+  ctx: Context,
+  fallback: CaseFallback<unknown>,
+  action: 'read' | 'opened',
+): string | undefined {
+  if (fallback.requestedPath === undefined) return;
+  const { requestedPath, resolvedPath } = fallback;
+  const resolved = inlineCode(resolvedPath);
+  const notice = `${inlineCode(requestedPath)} has no exact match; ${action} ${resolved}, the one file in that folder whose name matches it ignoring case. Write and delete tools match paths exactly — pass them ${resolved}.`;
+  ctx.enrich({ requestedPath });
+  ctx.enrich.notice(notice);
+  return notice;
 }
 
 /**
  * List the parent directory of `path` and return up to {@link MAX_SUGGESTIONS}
  * close-match candidates. Match order: case-insensitive equality first, then
  * extension-stripped equality. Returns `[]` on listing failure or empty
- * basename. Used by callers that need suggestions without performing the
- * underlying operation (e.g., `obsidian_open_in_ui`'s explicit messaging).
+ * basename. Used by callers that need suggestions without substituting a
+ * match (e.g., `obsidian_delete_note`'s exact-case miss, which names the
+ * candidates but never deletes one in place of the requested path).
  */
 export async function findSimilarPaths(
   ctx: Context,
@@ -110,13 +157,88 @@ export async function findSimilarPaths(
   return [...probe.caseMatches, ...probe.extInsensitive].slice(0, MAX_SUGGESTIONS);
 }
 
+/** What the parent folder listing shows about the spelling of a path. */
+export interface CaseVariants {
+  /** The path itself is listed under exactly that name. */
+  exact: boolean;
+  /** Listed files whose names equal the path's ignoring case, but not exactly (full vault paths). */
+  variants: string[];
+}
+
+/**
+ * Read the parent folder listing for files that differ from `path` only in
+ * letter case. A listing that fails, or that the read scope withholds, reads
+ * as empty, so no path outside the read scope is ever named; the caller's
+ * cancellation propagates as itself.
+ */
+export async function findCaseVariants(
+  ctx: Context,
+  svc: ObsidianService,
+  path: string,
+): Promise<CaseVariants> {
+  const { caseMatches } = await probeParentDir(ctx, svc, path);
+  const normalized = trimSlashes(path);
+  return {
+    exact: caseMatches.includes(normalized),
+    variants: caseMatches.filter((match) => match !== normalized),
+  };
+}
+
+/**
+ * Message, error data, and `literals` for a `case_variant_exists` refusal.
+ * `existingPath` is set only when exactly one variant is listed — never picked
+ * from several, and never inferred when none is: a file Obsidian does not
+ * index (a dot-file) refuses a write the same way and never appears in a
+ * listing. It is the path the caller sends back, so it is the one literal.
+ */
+export function caseVariantError(
+  path: string,
+  variants: readonly string[],
+): { data: { path: string; existingPath?: string }; literals: string[]; message: string } {
+  const existingPath = variants.length === 1 ? variants[0] : undefined;
+  if (existingPath === undefined) {
+    return {
+      message: `'${path}' collides with a file already on disk: one whose name differs only in letter case, or one Obsidian does not index.`,
+      data: { path },
+      literals: [],
+    };
+  }
+  return {
+    message: `Note '${existingPath}' already exists, and this vault's filesystem treats '${path}' as the same file.`,
+    data: { path, existingPath },
+    literals: [existingPath],
+  };
+}
+
+/**
+ * Run a whole-file write to `path`, and when the service refuses it as
+ * `case_variant_exists`, rethrow it naming the existing note from the parent
+ * listing. The listing is read only on that failure, so a write that succeeds
+ * costs no extra request.
+ */
+export async function withCaseVariantNamed<T>(
+  ctx: Context,
+  svc: ObsidianService,
+  path: string,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (err) {
+    if (!(err instanceof McpError) || err.data?.reason !== 'case_variant_exists') throw err;
+    const { variants } = await findCaseVariants(ctx, svc, path);
+    const { message, data, literals } = caseVariantError(path, variants);
+    throw conflict(message, { ...data, reason: 'case_variant_exists' }, { cause: err, literals });
+  }
+}
+
 async function probeParentDir(
   ctx: Context,
   svc: ObsidianService,
   path: string,
 ): Promise<ProbeResult> {
   const empty: ProbeResult = { caseMatches: [], extInsensitive: [] };
-  const normalized = path.replace(/^\/+|\/+$/g, '');
+  const normalized = trimSlashes(path);
   if (!normalized) return empty;
 
   const slash = normalized.lastIndexOf('/');
@@ -128,7 +250,9 @@ async function probeParentDir(
   try {
     const listing = await svc.listFiles(ctx, dir);
     entries = listing.files;
-  } catch {
+  } catch (err) {
+    // The caller's cancellation is not a listing that came back empty.
+    if (ctx.signal?.aborted) throw err;
     return empty;
   }
 
